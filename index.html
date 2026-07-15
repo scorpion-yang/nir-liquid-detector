@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b6bcb">
+  <title>近红外溶液识别</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <main class="app-shell">
+    <header class="hero">
+      <p class="eyebrow">ESP32 · BLE · ONNX</p>
+      <h1>近红外溶液识别</h1>
+      <p class="subtitle">连接采集设备，一键采集并在浏览器本地完成识别。</p>
+    </header>
+
+    <section class="card status-card">
+      <div>
+        <span class="label">设备状态</span>
+        <strong id="connectionText">未连接</strong>
+      </div>
+      <span id="connectionDot" class="dot offline" aria-hidden="true"></span>
+    </section>
+
+    <section id="compatibilityWarning" class="notice warning" hidden></section>
+
+    <section class="card controls">
+      <button id="connectButton" class="button primary">连接 ESP32</button>
+      <div class="measurement-row">
+        <label for="durationInput">采集时长</label>
+        <div class="input-with-unit">
+          <input id="durationInput" type="number" min="500" max="10000" step="100" value="1800">
+          <span>ms</span>
+        </div>
+      </div>
+      <button id="startButton" class="button success" disabled>开始采集并识别</button>
+      <button id="stopButton" class="button danger" disabled>停止采集</button>
+    </section>
+
+    <section class="card progress-card">
+      <div class="section-heading">
+        <h2>采集进度</h2>
+        <span id="sampleCount">0 个数据点</span>
+      </div>
+      <div class="progress-track" aria-label="采集进度">
+        <div id="progressBar" class="progress-bar"></div>
+      </div>
+      <canvas id="signalCanvas" width="800" height="260" aria-label="CH2 和 CH3 波形"></canvas>
+      <div class="legend">
+        <span><i class="legend-line ch2"></i>CH2</span>
+        <span><i class="legend-line ch3"></i>CH3</span>
+      </div>
+    </section>
+
+    <section class="card result-card">
+      <span class="label">识别结果</span>
+      <div id="resultName" class="result-name">等待采集</div>
+      <div id="resultConfidence" class="confidence">模型正在初始化…</div>
+      <div id="probabilityList" class="probability-list"></div>
+    </section>
+
+    <section class="card actions-card">
+      <button id="downloadButton" class="button secondary" disabled>下载本次 CSV</button>
+      <button id="disconnectButton" class="button ghost" disabled>断开设备</button>
+    </section>
+
+    <details class="card log-card">
+      <summary>运行日志</summary>
+      <pre id="logOutput"></pre>
+    </details>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/ort.min.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>

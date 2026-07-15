@@ -1,0 +1,14 @@
+{
+  "modelName": "CNN-BiGRU V2 20260627_001803",
+  "modelFormat": "ONNX",
+  "seqLen": 160,
+  "features": ["CH2_mV", "CH3_mV", "CH3_div_CH2", "CH3_minus_CH2"],
+  "labels": ["乙醇", "异丙醇", "水", "甲醇"],
+  "normalization": {
+    "mean": [463.74664306640625, 747.75830078125, 1.5549237728118896, 283.99847412109375],
+    "std": [109.55125427246094, 351.496337890625, 0.403574138879776, 259.9795227050781]
+  },
+  "confidenceThreshold": 0.7,
+  "sourceCheckpoint": "V2/runs/20260627_001803/20260627_001803_best_model.pt",
+  "recordedTestAccuracy": 0.975
+}
