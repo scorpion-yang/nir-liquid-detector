@@ -51,14 +51,13 @@ h1 { margin: 0; font-size: clamp(2rem, 8vw, 3.4rem); line-height: 1.02; }
   backdrop-filter: blur(12px);
 }
 
-.status-card, .section-heading, .measurement-row {
+.status-card, .measurement-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
 }
-.status-card > *, .section-heading > *, .measurement-row > * { min-width: 0; }
-.section-heading span { text-align: right; }
+.status-card > *, .measurement-row > * { min-width: 0; }
 
 .label { display: block; margin-bottom: 5px; color: var(--muted); font-size: .86rem; }
 .dot { width: 14px; height: 14px; border-radius: 50%; box-shadow: 0 0 0 6px rgba(105, 115, 134, .12); }
@@ -86,6 +85,8 @@ h1 { margin: 0; font-size: clamp(2rem, 8vw, 3.4rem); line-height: 1.02; }
 .danger { color: white; background: var(--red); }
 .secondary { color: var(--blue-dark); background: #dceeff; }
 .ghost { color: var(--ink); background: #edf1f6; }
+.led-off { color: #8a4b00; background: #fff0d9; border: 1px solid #f3c478; }
+.led-on { color: white; background: linear-gradient(135deg, #12a474, #087f5b); }
 
 .measurement-row { padding: 4px 2px; }
 .input-with-unit { display: flex; flex: 0 0 auto; align-items: center; gap: 8px; color: var(--muted); }
@@ -98,31 +99,15 @@ h1 { margin: 0; font-size: clamp(2rem, 8vw, 3.4rem); line-height: 1.02; }
   background: white;
 }
 
-.section-heading h2 { margin: 0; font-size: 1.05rem; }
-.section-heading span { color: var(--muted); font-size: .9rem; }
-.progress-track { height: 9px; margin: 16px 0; overflow: hidden; border-radius: 999px; background: #e7edf4; }
-.progress-bar { width: 0; height: 100%; background: linear-gradient(90deg, #0b6bcb, #22b8cf); transition: width .12s linear; }
-
-#signalCanvas { display: block; width: 100%; max-width: 100%; height: 180px; border-radius: 12px; background: #f8fafc; }
-.legend { display: flex; justify-content: center; gap: 20px; margin-top: 10px; color: var(--muted); font-size: .85rem; }
-.legend-line { display: inline-block; width: 18px; height: 3px; margin-right: 6px; vertical-align: middle; border-radius: 4px; }
-.legend-line.ch2 { background: #0b6bcb; }
-.legend-line.ch3 { background: #f08c00; }
-
 .result-card { text-align: center; }
 .result-name { margin-top: 8px; font-size: clamp(2rem, 10vw, 3.2rem); font-weight: 900; color: var(--blue-dark); }
 .confidence { margin-top: 6px; color: var(--muted); }
-.probability-list { display: grid; gap: 7px; margin-top: 16px; text-align: left; }
-.probability-row { display: grid; grid-template-columns: 64px 1fr 56px; align-items: center; gap: 9px; font-size: .86rem; }
-.probability-track { height: 7px; overflow: hidden; border-radius: 999px; background: #e8edf3; }
-.probability-fill { height: 100%; background: var(--blue); }
-
 .actions-card { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .log-card summary { cursor: pointer; font-weight: 800; }
 #logOutput { max-height: 220px; overflow: auto; white-space: pre-wrap; color: #354258; font-size: .78rem; line-height: 1.55; }
 
 @media (max-width: 430px) {
   .actions-card { grid-template-columns: 1fr; }
-  .measurement-row, .section-heading { flex-wrap: wrap; }
+  .measurement-row { flex-wrap: wrap; }
   .card { border-radius: 17px; padding: 16px; }
 }

@@ -11,8 +11,13 @@ const BLE = Object.freeze({
 const PROTOCOL = Object.freeze({
   sendHead: 0xa5,
   receiveHead: 0x5a,
+  ledCommand: 0x10,
   adcCommand: 0x30,
+  syncCommand: 0x40,
   adcPacketType: 0x01,
+  adcBatchPacketType: 0x07,
+  ledPacketType: 0x02,
+  syncPacketType: 0x04,
   stopMode: 0x00,
   continuousMode: 0x02,
 });
@@ -24,8 +29,11 @@ const state = {
   dataCharacteristic: null,
   statusCharacteristic: null,
   collecting: false,
+  ledOn: false,
+  ledPending: false,
   stopTimer: null,
   startTime: 0,
+  firstEspTimeUs: null,
   samples: [],
   rejectedPackets: 0,
   modelSession: null,
@@ -33,10 +41,9 @@ const state = {
 };
 
 const ui = Object.fromEntries([
-  "connectButton", "startButton", "stopButton", "disconnectButton", "downloadButton",
+  "connectButton", "ledButton", "startButton", "stopButton", "disconnectButton", "downloadButton",
   "durationInput", "connectionText", "connectionDot", "compatibilityWarning",
-  "sampleCount", "progressBar", "signalCanvas", "resultName", "resultConfidence",
-  "probabilityList", "logOutput",
+  "resultName", "resultConfidence", "logOutput",
 ].map((id) => [id, document.getElementById(id)]));
 
 function log(message) {
@@ -68,6 +75,16 @@ function setConnected(connected, name = "") {
   ui.connectButton.disabled = connected;
   ui.startButton.disabled = !connected || state.collecting;
   ui.disconnectButton.disabled = !connected;
+  ui.ledButton.disabled = !connected || state.ledPending;
+  if (!connected) state.ledOn = false;
+  updateLedButton();
+}
+
+function updateLedButton() {
+  ui.ledButton.textContent = state.ledOn ? "LED 已开启 · 点击关闭" : "LED 已关闭 · 点击开启";
+  ui.ledButton.setAttribute("aria-pressed", String(state.ledOn));
+  ui.ledButton.classList.toggle("led-on", state.ledOn);
+  ui.ledButton.classList.toggle("led-off", !state.ledOn);
 }
 
 function showCompatibility() {
@@ -114,17 +131,23 @@ async function connectDevice() {
     state.commandCharacteristic = await service.getCharacteristic(BLE.command);
     state.dataCharacteristic = await service.getCharacteristic(BLE.data);
     await state.dataCharacteristic.startNotifications();
-    state.dataCharacteristic.addEventListener("characteristicvaluechanged", handleDataPacket);
+    state.dataCharacteristic.addEventListener("characteristicvaluechanged", handleNotification);
 
     try {
       state.statusCharacteristic = await service.getCharacteristic(BLE.status);
       await state.statusCharacteristic.startNotifications();
+      state.statusCharacteristic.addEventListener("characteristicvaluechanged", handleNotification);
     } catch (error) {
       log(`状态特征订阅跳过：${error.message}`);
     }
 
     setConnected(true, device.name);
     log(`BLE 已连接：${device.name || "未命名设备"}`);
+    try {
+      await writeCommand(PROTOCOL.syncCommand, []);
+    } catch (error) {
+      log(`LED 状态同步跳过：${error.message}`);
+    }
   } catch (error) {
     log(`连接失败：${error.message}`);
   }
@@ -136,6 +159,8 @@ function handleDisconnected() {
   state.server = null;
   state.commandCharacteristic = null;
   state.dataCharacteristic = null;
+  state.statusCharacteristic = null;
+  state.ledPending = false;
   setConnected(false);
   ui.stopButton.disabled = true;
   log("ESP32 已断开");
@@ -153,6 +178,24 @@ async function writeCommand(commandId, params) {
   log(`发送指令：${Array.from(frame, (value) => value.toString(16).padStart(2, "0")).join(" ")}`);
 }
 
+async function toggleLed() {
+  if (!state.server?.connected || state.ledPending) return;
+  const requestedState = !state.ledOn;
+  state.ledPending = true;
+  ui.ledButton.disabled = true;
+  try {
+    await writeCommand(PROTOCOL.ledCommand, [requestedState ? 1 : 0]);
+    state.ledOn = requestedState;
+    updateLedButton();
+    log(`LED ${requestedState ? "已开启" : "已关闭"}`);
+  } catch (error) {
+    log(`LED 控制失败：${error.message}`);
+  } finally {
+    state.ledPending = false;
+    ui.ledButton.disabled = !state.server?.connected;
+  }
+}
+
 async function startCollection() {
   if (!state.server?.connected || state.collecting) return;
   const duration = Math.max(500, Math.min(10000, Number(ui.durationInput.value) || 1800));
@@ -160,15 +203,13 @@ async function startCollection() {
   state.samples = [];
   state.rejectedPackets = 0;
   state.startTime = performance.now();
+  state.firstEspTimeUs = null;
   state.collecting = true;
   ui.startButton.disabled = true;
   ui.stopButton.disabled = false;
   ui.downloadButton.disabled = true;
   ui.resultName.textContent = "采集中…";
   ui.resultConfidence.textContent = `计划采集 ${duration} ms`;
-  ui.probabilityList.innerHTML = "";
-  updateProgress(duration);
-  drawSignals();
 
   try {
     await writeCommand(PROTOCOL.adcCommand, [PROTOCOL.continuousMode]);
@@ -193,8 +234,7 @@ async function stopCollection(runInference = true) {
   ui.startButton.disabled = !state.server?.connected;
   ui.stopButton.disabled = true;
   ui.downloadButton.disabled = state.samples.length === 0;
-  ui.progressBar.style.width = "100%";
-  log(`采集结束：有效 ${state.samples.length} 包，无效 ${state.rejectedPackets} 包`);
+  log(`采集结束：有效 ${state.samples.length} 个数据点，无效 ${state.rejectedPackets} 个数据包`);
 
   if (state.samples.length < 2) {
     ui.resultName.textContent = "数据不足";
@@ -204,33 +244,77 @@ async function stopCollection(runInference = true) {
   if (runInference) await classifySamples();
 }
 
-function handleDataPacket(event) {
+function handleNotification(event) {
   const view = event.target.value;
   const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
-  if (bytes.length < 10 || bytes[0] !== PROTOCOL.receiveHead || bytes[1] !== PROTOCOL.adcPacketType) return;
+  if (bytes.length < 3 || bytes[0] !== PROTOCOL.receiveHead) return;
   if (sumChecksum(bytes.subarray(0, -1)) !== bytes[bytes.length - 1]) {
     state.rejectedPackets += 1;
     return;
   }
+
+  const packetType = bytes[1];
+  if (packetType === PROTOCOL.ledPacketType && bytes.length >= 5) {
+    state.ledOn = bytes[2] !== 0;
+    updateLedButton();
+    return;
+  }
+  if (packetType === PROTOCOL.syncPacketType && bytes.length >= 7) {
+    state.ledOn = bytes[2] !== 0;
+    updateLedButton();
+    return;
+  }
   if (!state.collecting) return;
 
-  state.samples.push({
-    elapsedMs: performance.now() - state.startTime,
-    ch1: view.getUint16(2, true),
-    ch2: view.getUint16(4, true),
-    ch3: view.getUint16(6, true),
-    roundIndex: view.getUint8(8),
-  });
+  if (packetType === PROTOCOL.adcPacketType && bytes.length === 10) {
+    state.samples.push({
+      elapsedMs: performance.now() - state.startTime,
+      sampleIndex: state.samples.length,
+      espTimeUs: null,
+      ch1: view.getUint16(2, true),
+      ch2: view.getUint16(4, true),
+      ch3: view.getUint16(6, true),
+      roundIndex: view.getUint8(8),
+    });
+    return;
+  }
 
-  const duration = Number(ui.durationInput.value) || 1800;
-  updateProgress(duration);
-  if (state.samples.length % 4 === 0) drawSignals();
+  if (packetType === PROTOCOL.adcBatchPacketType) parseAdcBatch(view);
 }
 
-function updateProgress(duration) {
-  const elapsed = state.collecting ? performance.now() - state.startTime : duration;
-  ui.progressBar.style.width = `${Math.min(100, elapsed / duration * 100)}%`;
-  ui.sampleCount.textContent = `${state.samples.length} 个数据点`;
+function getUint64AsNumber(view, offset) {
+  const low = view.getUint32(offset, true);
+  const high = view.getUint32(offset + 4, true);
+  return high * 0x100000000 + low;
+}
+
+function parseAdcBatch(view) {
+  if (view.byteLength < 5) return;
+  const roundIndex = view.getUint8(2);
+  const sampleCount = view.getUint8(3);
+  const expectedLength = 5 + sampleCount * 16;
+  if (view.byteLength !== expectedLength) {
+    state.rejectedPackets += 1;
+    return;
+  }
+  let offset = 4;
+  for (let index = 0; index < sampleCount; index += 1) {
+    const sampleIndex = view.getUint32(offset, true);
+    const espTimeUs = getUint64AsNumber(view, offset + 4);
+    const ch2 = view.getUint16(offset + 12, true);
+    const ch3 = view.getUint16(offset + 14, true);
+    if (state.firstEspTimeUs === null) state.firstEspTimeUs = espTimeUs;
+    state.samples.push({
+      elapsedMs: (espTimeUs - state.firstEspTimeUs) / 1000,
+      sampleIndex,
+      espTimeUs,
+      ch1: null,
+      ch2,
+      ch3,
+      roundIndex,
+    });
+    offset += 16;
+  }
 }
 
 function resample(values, targetLength) {
@@ -284,8 +368,7 @@ async function classifySamples() {
     const confidence = probabilities[bestIndex];
     const threshold = state.metadata.confidenceThreshold ?? 0.7;
     ui.resultName.textContent = confidence >= threshold ? state.metadata.labels[bestIndex] : "无法可靠识别";
-    ui.resultConfidence.textContent = `置信度 ${(confidence * 100).toFixed(1)}% · ${state.samples.length} 个数据点`;
-    renderProbabilities(probabilities);
+    ui.resultConfidence.textContent = "";
     log(`推理完成：${state.metadata.labels[bestIndex]} ${(confidence * 100).toFixed(2)}%`);
   } catch (error) {
     ui.resultName.textContent = "推理失败";
@@ -294,58 +377,11 @@ async function classifySamples() {
   }
 }
 
-function renderProbabilities(probabilities) {
-  ui.probabilityList.innerHTML = probabilities
-    .map((probability, index) => ({ probability, label: state.metadata.labels[index] }))
-    .sort((a, b) => b.probability - a.probability)
-    .map(({ probability, label }) => `
-      <div class="probability-row">
-        <span>${label}</span>
-        <div class="probability-track"><div class="probability-fill" style="width:${probability * 100}%"></div></div>
-        <strong>${(probability * 100).toFixed(1)}%</strong>
-      </div>`).join("");
-}
-
-function drawSignals() {
-  const canvas = ui.signalCanvas;
-  const context = canvas.getContext("2d");
-  const width = canvas.width;
-  const height = canvas.height;
-  context.clearRect(0, 0, width, height);
-  context.strokeStyle = "#e0e6ee";
-  context.lineWidth = 1;
-  for (let row = 1; row < 4; row += 1) {
-    context.beginPath();
-    context.moveTo(0, height * row / 4);
-    context.lineTo(width, height * row / 4);
-    context.stroke();
-  }
-  if (state.samples.length < 2) return;
-  const allValues = state.samples.flatMap((sample) => [sample.ch2, sample.ch3]);
-  let minValue = Math.min(...allValues);
-  let maxValue = Math.max(...allValues);
-  if (maxValue === minValue) maxValue = minValue + 1;
-  const drawChannel = (key, color) => {
-    context.beginPath();
-    context.strokeStyle = color;
-    context.lineWidth = 3;
-    state.samples.forEach((sample, index) => {
-      const x = index / (state.samples.length - 1) * width;
-      const y = height - (sample[key] - minValue) / (maxValue - minValue) * height;
-      if (index === 0) context.moveTo(x, y);
-      else context.lineTo(x, y);
-    });
-    context.stroke();
-  };
-  drawChannel("ch2", "#0b6bcb");
-  drawChannel("ch3", "#f08c00");
-}
-
 function downloadCsv() {
   if (!state.samples.length) return;
-  const rows = ["Elapsed_ms,CH1_mV,CH2_mV,CH3_mV,Round_Index"];
+  const rows = ["Elapsed_ms,Sample_Index,ESP_Time_us,CH1_mV,CH2_mV,CH3_mV,Round_Index"];
   for (const sample of state.samples) {
-    rows.push(`${sample.elapsedMs.toFixed(3)},${sample.ch1},${sample.ch2},${sample.ch3},${sample.roundIndex}`);
+    rows.push(`${sample.elapsedMs.toFixed(3)},${sample.sampleIndex},${sample.espTimeUs ?? ""},${sample.ch1 ?? ""},${sample.ch2},${sample.ch3},${sample.roundIndex}`);
   }
   const blob = new Blob(["\ufeff" + rows.join("\r\n")], { type: "text/csv;charset=utf-8" });
   const link = document.createElement("a");
@@ -356,12 +392,12 @@ function downloadCsv() {
 }
 
 ui.connectButton.addEventListener("click", connectDevice);
+ui.ledButton.addEventListener("click", toggleLed);
 ui.startButton.addEventListener("click", startCollection);
 ui.stopButton.addEventListener("click", () => stopCollection(true));
 ui.disconnectButton.addEventListener("click", disconnectDevice);
 ui.downloadButton.addEventListener("click", downloadCsv);
 
-showCompatibility();
 setConnected(false);
-drawSignals();
+showCompatibility();
 loadModel();

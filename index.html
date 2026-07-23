@@ -27,6 +27,7 @@
 
     <section class="card controls">
       <button id="connectButton" class="button primary">连接 ESP32</button>
+      <button id="ledButton" class="button led-off" type="button" aria-pressed="false" disabled>LED 已关闭 · 点击开启</button>
       <div class="measurement-row">
         <label for="durationInput">采集时长</label>
         <div class="input-with-unit">
@@ -38,26 +39,10 @@
       <button id="stopButton" class="button danger" disabled>停止采集</button>
     </section>
 
-    <section class="card progress-card">
-      <div class="section-heading">
-        <h2>采集进度</h2>
-        <span id="sampleCount">0 个数据点</span>
-      </div>
-      <div class="progress-track" aria-label="采集进度">
-        <div id="progressBar" class="progress-bar"></div>
-      </div>
-      <canvas id="signalCanvas" width="800" height="260" aria-label="CH2 和 CH3 波形"></canvas>
-      <div class="legend">
-        <span><i class="legend-line ch2"></i>CH2</span>
-        <span><i class="legend-line ch3"></i>CH3</span>
-      </div>
-    </section>
-
     <section class="card result-card">
       <span class="label">识别结果</span>
       <div id="resultName" class="result-name">等待采集</div>
       <div id="resultConfidence" class="confidence">模型正在初始化…</div>
-      <div id="probabilityList" class="probability-list"></div>
     </section>
 
     <section class="card actions-card">
