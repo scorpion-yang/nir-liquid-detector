@@ -85,8 +85,6 @@ h1 { margin: 0; font-size: clamp(2rem, 8vw, 3.4rem); line-height: 1.02; }
 .danger { color: white; background: var(--red); }
 .secondary { color: var(--blue-dark); background: #dceeff; }
 .ghost { color: var(--ink); background: #edf1f6; }
-.led-off { color: #8a4b00; background: #fff0d9; border: 1px solid #f3c478; }
-.led-on { color: white; background: linear-gradient(135deg, #12a474, #087f5b); }
 
 .measurement-row { padding: 4px 2px; }
 .input-with-unit { display: flex; flex: 0 0 auto; align-items: center; gap: 8px; color: var(--muted); }
