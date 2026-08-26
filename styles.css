@@ -28,7 +28,7 @@ button, input { font: inherit; }
 
 .app-shell {
   width: calc(100vw - 28px);
-  max-width: 680px;
+  max-width: 760px;
   margin: 0 auto;
   padding: max(24px, env(safe-area-inset-top)) 0 max(36px, env(safe-area-inset-bottom));
 }
@@ -51,13 +51,13 @@ h1 { margin: 0; font-size: clamp(2rem, 8vw, 3.4rem); line-height: 1.02; }
   backdrop-filter: blur(12px);
 }
 
-.status-card, .measurement-row {
+.status-card, .measurement-row, .chart-heading {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
 }
-.status-card > *, .measurement-row > * { min-width: 0; }
+.status-card > *, .measurement-row > *, .chart-heading > * { min-width: 0; }
 
 .label { display: block; margin-bottom: 5px; color: var(--muted); font-size: .86rem; }
 .dot { width: 14px; height: 14px; border-radius: 50%; box-shadow: 0 0 0 6px rgba(105, 115, 134, .12); }
@@ -86,26 +86,51 @@ h1 { margin: 0; font-size: clamp(2rem, 8vw, 3.4rem); line-height: 1.02; }
 .secondary { color: var(--blue-dark); background: #dceeff; }
 .ghost { color: var(--ink); background: #edf1f6; }
 
-.measurement-row { padding: 4px 2px; }
+.measurement-row { padding: 4px 2px 0; }
 .input-with-unit { display: flex; flex: 0 0 auto; align-items: center; gap: 8px; color: var(--muted); }
 .input-with-unit input {
-  width: 96px;
+  width: 112px;
   border: 1px solid var(--line);
   border-radius: 10px;
   padding: 10px;
   text-align: right;
   background: white;
 }
+.hint { margin: -4px 2px 2px; color: var(--muted); font-size: .84rem; line-height: 1.45; }
 
 .result-card { text-align: center; }
-.result-name { margin-top: 8px; font-size: clamp(2rem, 10vw, 3.2rem); font-weight: 900; color: var(--blue-dark); }
-.confidence { margin-top: 6px; color: var(--muted); }
+.result-name { margin-top: 8px; font-size: clamp(2.3rem, 11vw, 4rem); font-weight: 900; color: var(--blue-dark); }
+.confidence { min-height: 1.4em; margin-top: 6px; color: var(--muted); }
+
+.chart-heading { align-items: flex-end; }
+.round-status {
+  flex: 0 0 auto;
+  padding: 6px 10px;
+  border-radius: 999px;
+  color: var(--blue-dark);
+  background: #e4f1ff;
+  font-size: .82rem;
+  font-weight: 800;
+}
+.chart-wrap {
+  width: 100%;
+  height: 310px;
+  margin-top: 16px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  overflow: hidden;
+  background: linear-gradient(180deg, #fff, #f8fbff);
+}
+#concentrationChart { display: block; width: 100%; height: 100%; }
+
 .actions-card { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .log-card summary { cursor: pointer; font-weight: 800; }
-#logOutput { max-height: 220px; overflow: auto; white-space: pre-wrap; color: #354258; font-size: .78rem; line-height: 1.55; }
+#logOutput { max-height: 240px; overflow: auto; white-space: pre-wrap; color: #354258; font-size: .78rem; line-height: 1.55; }
 
 @media (max-width: 430px) {
   .actions-card { grid-template-columns: 1fr; }
   .measurement-row { flex-wrap: wrap; }
   .card { border-radius: 17px; padding: 16px; }
+  .chart-wrap { height: 270px; }
+  .chart-heading { align-items: center; }
 }

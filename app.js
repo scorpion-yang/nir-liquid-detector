@@ -12,6 +12,8 @@ const PROTOCOL = Object.freeze({
   sendHead: 0xa5,
   receiveHead: 0x5a,
   ledCommand: 0x10,
+  servoTypeCommand: 0x24,
+  servoConfigCommand: 0x25,
   adcCommand: 0x30,
   syncCommand: 0x40,
   adcPacketType: 0x01,
@@ -20,30 +22,48 @@ const PROTOCOL = Object.freeze({
   syncPacketType: 0x04,
   stopMode: 0x00,
   continuousMode: 0x02,
+  servo360Mode: 0x01,
+});
+
+const ACQUISITION = Object.freeze({
+  samplesPerRound: 224,
+  windowSeconds: 1.5,
+  firmwareDurationMs: 1500,
+  servoSpeedPercent: 20,
+  roundTimeoutMs: 4500,
+  minimumTotalSeconds: 2,
+  maximumTotalSeconds: 600,
 });
 
 const state = {
+  compatible: true,
   device: null,
   server: null,
   commandCharacteristic: null,
   dataCharacteristic: null,
   statusCharacteristic: null,
-  collecting: false,
   ledOn: false,
   ledPending: false,
-  stopTimer: null,
-  startTime: 0,
-  firstEspTimeUs: null,
-  samples: [],
-  rejectedPackets: 0,
   modelSessions: [],
   metadata: null,
+  runId: 0,
+  runActive: false,
+  processing: false,
+  abortRequested: false,
+  plannedRounds: 0,
+  currentRound: null,
+  cleanupPromise: null,
+  inferenceChain: Promise.resolve(),
+  inferencePromises: [],
+  rawRounds: [],
+  results: [],
+  rejectedPackets: 0,
 };
 
 const ui = Object.fromEntries([
   "connectButton", "startButton", "stopButton", "disconnectButton", "downloadButton",
-  "durationInput", "connectionText", "connectionDot", "compatibilityWarning",
-  "resultName", "resultConfidence", "logOutput",
+  "durationInput", "durationHint", "connectionText", "connectionDot", "compatibilityWarning",
+  "resultName", "resultDetail", "roundStatus", "concentrationChart", "logOutput",
 ].map((id) => [id, document.getElementById(id)]));
 
 function log(message) {
@@ -68,65 +88,117 @@ function buildCommand(commandId, params = []) {
   return frame;
 }
 
+function isConnected() {
+  return Boolean(state.server?.connected);
+}
+
+function modelsReady() {
+  return Boolean(state.metadata)
+    && state.modelSessions.length === 5
+    && state.modelSessions.length === state.metadata.folds.length;
+}
+
+function updateControls() {
+  const connected = isConnected();
+  ui.connectButton.disabled = connected || state.processing || !state.compatible;
+  ui.startButton.disabled = !connected || !modelsReady() || state.processing;
+  ui.stopButton.disabled = !state.runActive;
+  ui.disconnectButton.disabled = !connected;
+  ui.durationInput.disabled = state.processing;
+  ui.downloadButton.disabled = state.results.length === 0;
+}
+
 function setConnected(connected, name = "") {
   ui.connectionText.textContent = connected ? `已连接：${name || BLE.deviceName}` : "未连接";
   ui.connectionDot.classList.toggle("online", connected);
   ui.connectionDot.classList.toggle("offline", !connected);
-  ui.connectButton.disabled = connected;
-  const modelsReady = state.metadata && state.modelSessions.length === state.metadata.folds.length;
-  ui.startButton.disabled = !connected || state.collecting || !modelsReady;
-  ui.disconnectButton.disabled = !connected;
   if (!connected) state.ledOn = false;
+  updateControls();
 }
 
 function showCompatibility() {
   const messages = [];
-  if (!window.isSecureContext) messages.push("当前页面不是安全上下文。请使用 HTTPS，或在电脑/手机上通过 http://localhost 打开。");
-  if (!("bluetooth" in navigator)) messages.push("当前浏览器没有 Web Bluetooth。请使用 Android Chrome，或 Windows 上的 Chrome/Edge。");
+  if (!window.isSecureContext) messages.push("当前页面不是安全上下文，请通过 HTTPS 的 GitHub Pages 打开。");
+  if (!("bluetooth" in navigator)) messages.push("当前浏览器不支持 Web Bluetooth，请使用 Android Chrome 或 Windows Chrome/Edge。");
   if (messages.length) {
+    state.compatible = false;
     ui.compatibilityWarning.hidden = false;
     ui.compatibilityWarning.textContent = messages.join(" ");
     ui.connectButton.disabled = true;
   }
 }
 
-async function loadModel() {
+function formatSeconds(value) {
+  return Number.isInteger(value) ? String(value) : value.toFixed(1);
+}
+
+function getDurationPlan(clampValue = false) {
+  let seconds = Number(ui.durationInput.value);
+  if (clampValue) {
+    if (!Number.isFinite(seconds)) seconds = 60;
+    seconds = Math.max(ACQUISITION.minimumTotalSeconds, Math.min(ACQUISITION.maximumTotalSeconds, seconds));
+    ui.durationInput.value = String(seconds);
+  }
+  if (!Number.isFinite(seconds)
+      || seconds < ACQUISITION.minimumTotalSeconds
+      || seconds > ACQUISITION.maximumTotalSeconds) {
+    return null;
+  }
+  const rounds = Math.floor(seconds / ACQUISITION.windowSeconds);
+  return { seconds, rounds, finalTime: rounds * ACQUISITION.windowSeconds };
+}
+
+function updateDurationHint() {
+  const plan = getDurationPlan(false);
+  if (!plan) {
+    ui.durationHint.textContent = "请输入 2–600 秒";
+    return;
+  }
+  ui.durationHint.textContent = `共 ${plan.rounds} 轮；最后一个结果位于 ${formatSeconds(plan.finalTime)} 秒`;
+  if (!state.processing) {
+    state.plannedRounds = plan.rounds;
+    drawChart();
+  }
+}
+
+async function loadModels() {
   try {
     if (!window.ort) throw new Error("ONNX Runtime Web 未加载，请检查网络连接");
+    if (!window.NIRPreprocessing) throw new Error("V8 数据预处理模块未加载");
     ort.env.wasm.numThreads = 1;
     ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/";
-    const metadataResponse = await fetch("./model/metadata.json", { cache: "no-store" });
-    if (!metadataResponse.ok) throw new Error(`模型元数据加载失败：HTTP ${metadataResponse.status}`);
-    state.metadata = await metadataResponse.json();
+    const response = await fetch("./model/metadata.json", { cache: "no-store" });
+    if (!response.ok) throw new Error(`模型元数据加载失败：HTTP ${response.status}`);
+    state.metadata = await response.json();
+    if (state.metadata.task !== "regression" || state.metadata.seqLen !== ACQUISITION.samplesPerRound) {
+      throw new Error("模型元数据与 224 点浓度检测流程不匹配");
+    }
     if (!Array.isArray(state.metadata.folds) || state.metadata.folds.length !== 5) {
       throw new Error("模型元数据必须包含五个交叉验证模型");
     }
     state.modelSessions = [];
     for (let index = 0; index < state.metadata.folds.length; index += 1) {
-      ui.resultConfidence.textContent = `正在加载模型 ${index + 1}/5…`;
+      ui.resultDetail.textContent = `正在加载模型 ${index + 1}/5…`;
       const session = await ort.InferenceSession.create(state.metadata.folds[index].modelPath, {
         executionProviders: ["wasm"],
         graphOptimizationLevel: "all",
       });
       state.modelSessions.push(session);
     }
-    ui.resultConfidence.textContent = `五模型已就绪 · 输入 ${state.metadata.seqLen}×${state.metadata.inputChannels}`;
-    log(`五折模型加载完成，输入 ${state.metadata.seqLen}×${state.metadata.inputChannels}`);
-    setConnected(Boolean(state.server?.connected), state.device?.name);
+    ui.resultDetail.textContent = "五个浓度模型已就绪";
+    log("V8 五折浓度模型加载完成");
   } catch (error) {
     state.modelSessions = [];
-    ui.resultConfidence.textContent = "五模型加载失败，请检查网络后刷新页面";
+    ui.resultDetail.textContent = "模型加载失败，请检查网络后刷新页面";
     log(`模型加载失败：${error.message}`);
-    setConnected(Boolean(state.server?.connected), state.device?.name);
   }
+  updateControls();
 }
 
 async function connectDevice() {
   try {
     log("正在打开蓝牙设备选择器…");
-    const device = await navigator.bluetooth.requestDevice({
-      filters: [{ services: [BLE.service] }],
-    });
+    const device = await navigator.bluetooth.requestDevice({ filters: [{ services: [BLE.service] }] });
     state.device = device;
     device.addEventListener("gattserverdisconnected", handleDisconnected);
     state.server = await device.gatt.connect();
@@ -146,59 +218,55 @@ async function connectDevice() {
 
     setConnected(true, device.name);
     log(`BLE 已连接：${device.name || "未命名设备"}`);
-    try {
-      await writeCommand(PROTOCOL.syncCommand, []);
-    } catch (error) {
-      log(`LED 状态同步跳过：${error.message}`);
-    }
+    await writeCommand(PROTOCOL.syncCommand, [], false);
   } catch (error) {
     log(`连接失败：${error.message}`);
+    setConnected(false);
   }
 }
 
+function rejectCurrentRound(error) {
+  const context = state.currentRound;
+  if (!context?.accepting) return;
+  context.accepting = false;
+  clearTimeout(context.timeoutId);
+  context.reject(error);
+}
+
 function handleDisconnected() {
-  clearTimeout(state.stopTimer);
-  state.collecting = false;
+  state.runActive = false;
+  state.abortRequested = true;
+  rejectCurrentRound(new Error("ESP32 蓝牙连接已断开"));
   state.server = null;
   state.commandCharacteristic = null;
   state.dataCharacteristic = null;
   state.statusCharacteristic = null;
   state.ledPending = false;
   setConnected(false);
-  ui.stopButton.disabled = true;
   log("ESP32 已断开");
 }
 
 async function disconnectDevice() {
-  if (!state.device?.gatt?.connected) {
-    handleDisconnected();
-    return;
-  }
-  if (state.collecting) {
-    await stopCollection(false);
-  } else if (state.ledOn) {
-    try {
-      await setLed(false);
-    } catch (error) {
-      log(`断开前关闭 LED 失败：${error.message}`);
-    }
-  }
-  state.device.gatt.disconnect();
+  if (state.runActive) await stopCollection();
+  if (state.device?.gatt?.connected) state.device.gatt.disconnect();
+  else handleDisconnected();
 }
 
-async function writeCommand(commandId, params) {
+async function writeCommand(commandId, params, writeLog = true) {
   if (!state.commandCharacteristic) throw new Error("命令特征不可用");
   const frame = buildCommand(commandId, params);
   await state.commandCharacteristic.writeValueWithResponse(frame);
-  log(`发送指令：${Array.from(frame, (value) => value.toString(16).padStart(2, "0")).join(" ")}`);
+  if (writeLog) {
+    log(`发送指令：${Array.from(frame, (value) => value.toString(16).padStart(2, "0")).join(" ")}`);
+  }
 }
 
 async function setLed(enabled) {
-  if (!state.server?.connected) throw new Error("设备未连接");
+  if (!isConnected()) throw new Error("设备未连接");
   if (state.ledPending) throw new Error("LED 指令正在执行");
   state.ledPending = true;
   try {
-    await writeCommand(PROTOCOL.ledCommand, [enabled ? 1 : 0]);
+    await writeCommand(PROTOCOL.ledCommand, [enabled ? 1 : 0], false);
     state.ledOn = enabled;
     log(`LED ${enabled ? "已开启" : "已关闭"}`);
   } finally {
@@ -206,115 +274,96 @@ async function setLed(enabled) {
   }
 }
 
-function delay(milliseconds) {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+function littleEndianBytes(value, byteCount) {
+  const output = [];
+  let remaining = value;
+  for (let index = 0; index < byteCount; index += 1) {
+    output.push(remaining & 0xff);
+    remaining = Math.floor(remaining / 256);
+  }
+  return output;
 }
 
-async function startCollection() {
-  if (!state.server?.connected || state.collecting || state.modelSessions.length !== 5) return;
-  const duration = Math.max(500, Math.min(10000, Number(ui.durationInput.value) || 1800));
-  ui.durationInput.value = duration;
-  state.samples = [];
-  state.rejectedPackets = 0;
-  state.firstEspTimeUs = null;
-  state.collecting = true;
-  ui.startButton.disabled = true;
-  ui.stopButton.disabled = true;
-  ui.disconnectButton.disabled = true;
-  ui.downloadButton.disabled = true;
-  ui.resultName.textContent = "采集中…";
-  ui.resultConfidence.textContent = `计划采集 ${duration} ms`;
-
-  try {
-    await setLed(true);
-    await delay(100);
-    state.startTime = performance.now();
-    await writeCommand(PROTOCOL.adcCommand, [PROTOCOL.continuousMode]);
-    ui.stopButton.disabled = false;
-    ui.disconnectButton.disabled = false;
-    state.stopTimer = setTimeout(() => { void stopCollection(true); }, duration);
-  } catch (error) {
-    state.collecting = false;
-    try {
-      await setLed(false);
-    } catch (ledError) {
-      log(`关闭 LED 失败：${ledError.message}`);
-    }
-    ui.startButton.disabled = !state.server?.connected || state.modelSessions.length !== 5;
-    ui.stopButton.disabled = true;
-    ui.disconnectButton.disabled = !state.server?.connected;
-    ui.resultName.textContent = "采集失败";
-    ui.resultConfidence.textContent = error.message;
-    log(`启动采集失败：${error.message}`);
-  }
+async function configureHardware(rounds) {
+  await setLed(true);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  await writeCommand(PROTOCOL.servoTypeCommand, [PROTOCOL.servo360Mode], false);
+  const params = [
+    ...littleEndianBytes(ACQUISITION.firmwareDurationMs, 4),
+    ...littleEndianBytes(rounds, 2),
+    ACQUISITION.servoSpeedPercent,
+  ];
+  await writeCommand(PROTOCOL.servoConfigCommand, params, false);
+  log(`采集参数已设置：每轮 1500 ms，${rounds} 轮，舵机速度 20%`);
 }
 
-async function stopCollection(runInference = true) {
-  if (!state.collecting) return;
-  clearTimeout(state.stopTimer);
-  state.collecting = false;
-  ui.startButton.disabled = true;
-  ui.stopButton.disabled = true;
-  ui.disconnectButton.disabled = true;
-  try {
-    await writeCommand(PROTOCOL.adcCommand, [PROTOCOL.stopMode]);
-  } catch (error) {
-    log(`停止指令发送失败：${error.message}`);
-  }
-  try {
-    await setLed(false);
-  } catch (error) {
-    log(`关闭 LED 失败：${error.message}`);
-  }
-  ui.downloadButton.disabled = state.samples.length === 0;
-  log(`采集结束：有效 ${state.samples.length} 个数据点，无效 ${state.rejectedPackets} 个数据包`);
-
-  if (state.samples.length < 2) {
-    ui.resultName.textContent = "数据不足";
-    ui.resultConfidence.textContent = "至少需要 2 个有效数据点";
-    ui.startButton.disabled = !state.server?.connected || state.modelSessions.length !== 5;
-    ui.disconnectButton.disabled = !state.server?.connected;
-    return;
-  }
-  if (runInference) await classifySamples();
-  ui.startButton.disabled = !state.server?.connected || state.modelSessions.length !== 5;
-  ui.disconnectButton.disabled = !state.server?.connected;
+function armRound(roundNumber) {
+  let resolve;
+  let reject;
+  const completed = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  const context = {
+    roundNumber,
+    deviceRoundIndex: null,
+    samplesByIndex: new Map(),
+    firstEspTimeUs: null,
+    accepting: true,
+    resolve,
+    reject,
+    completed,
+    timeoutId: null,
+  };
+  context.timeoutId = setTimeout(() => {
+    if (!context.accepting) return;
+    context.accepting = false;
+    context.reject(new Error(
+      `第 ${roundNumber} 轮等待超时：只收到 ${context.samplesByIndex.size}/${ACQUISITION.samplesPerRound} 个有效点`,
+    ));
+  }, ACQUISITION.roundTimeoutMs);
+  state.currentRound = context;
+  ui.roundStatus.textContent = `第 ${roundNumber}/${state.plannedRounds} 轮 · 0/224 点`;
+  return context;
 }
 
-function handleNotification(event) {
-  const view = event.target.value;
-  const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
-  if (bytes.length < 3 || bytes[0] !== PROTOCOL.receiveHead) return;
-  if (sumChecksum(bytes.subarray(0, -1)) !== bytes[bytes.length - 1]) {
-    state.rejectedPackets += 1;
-    return;
-  }
+function acceptBatch(roundIndex, samples) {
+  const context = state.currentRound;
+  if (!state.runActive || !context?.accepting) return;
 
-  const packetType = bytes[1];
-  if (packetType === PROTOCOL.ledPacketType && bytes.length >= 5) {
-    state.ledOn = bytes[2] !== 0;
-    return;
+  let startAt = 0;
+  if (context.deviceRoundIndex === null) {
+    startAt = samples.findIndex((sample) => sample.sampleIndex === 0);
+    if (startAt < 0) return;
+    context.deviceRoundIndex = roundIndex;
   }
-  if (packetType === PROTOCOL.syncPacketType && bytes.length >= 7) {
-    state.ledOn = bytes[2] !== 0;
-    return;
-  }
-  if (!state.collecting) return;
+  if (roundIndex !== context.deviceRoundIndex) return;
 
-  if (packetType === PROTOCOL.adcPacketType && bytes.length === 10) {
-    state.samples.push({
-      elapsedMs: performance.now() - state.startTime,
-      sampleIndex: state.samples.length,
-      espTimeUs: null,
-      ch1: view.getUint16(2, true),
-      ch2: view.getUint16(4, true),
-      ch3: view.getUint16(6, true),
-      roundIndex: view.getUint8(8),
+  for (let index = startAt; index < samples.length; index += 1) {
+    const sample = samples[index];
+    if (sample.sampleIndex < 0 || sample.sampleIndex >= ACQUISITION.samplesPerRound) continue;
+    if (context.samplesByIndex.has(sample.sampleIndex)) continue;
+    if (context.firstEspTimeUs === null) context.firstEspTimeUs = sample.espTimeUs;
+    context.samplesByIndex.set(sample.sampleIndex, {
+      ...sample,
+      roundIndex,
+      elapsedInRoundMs: (sample.espTimeUs - context.firstEspTimeUs) / 1000,
     });
-    return;
   }
 
-  if (packetType === PROTOCOL.adcBatchPacketType) parseAdcBatch(view);
+  const pointCount = context.samplesByIndex.size;
+  ui.roundStatus.textContent = `第 ${context.roundNumber}/${state.plannedRounds} 轮 · ${pointCount}/224 点`;
+  if (pointCount !== ACQUISITION.samplesPerRound) return;
+
+  const ordered = [];
+  for (let sampleIndex = 0; sampleIndex < ACQUISITION.samplesPerRound; sampleIndex += 1) {
+    const sample = context.samplesByIndex.get(sampleIndex);
+    if (!sample) return;
+    ordered.push(sample);
+  }
+  context.accepting = false;
+  clearTimeout(context.timeoutId);
+  context.resolve(ordered);
 }
 
 function getUint64AsNumber(view, offset) {
@@ -327,66 +376,47 @@ function parseAdcBatch(view) {
   if (view.byteLength < 5) return;
   const roundIndex = view.getUint8(2);
   const sampleCount = view.getUint8(3);
-  const expectedLength = 5 + sampleCount * 16;
-  if (view.byteLength !== expectedLength) {
+  if (view.byteLength !== 5 + sampleCount * 16) {
     state.rejectedPackets += 1;
     return;
   }
+  const samples = [];
   let offset = 4;
   for (let index = 0; index < sampleCount; index += 1) {
-    const sampleIndex = view.getUint32(offset, true);
-    const espTimeUs = getUint64AsNumber(view, offset + 4);
-    const ch2 = view.getUint16(offset + 12, true);
-    const ch3 = view.getUint16(offset + 14, true);
-    if (state.firstEspTimeUs === null) state.firstEspTimeUs = espTimeUs;
-    state.samples.push({
-      elapsedMs: (espTimeUs - state.firstEspTimeUs) / 1000,
-      sampleIndex,
-      espTimeUs,
-      ch1: null,
-      ch2,
-      ch3,
-      roundIndex,
+    samples.push({
+      sampleIndex: view.getUint32(offset, true),
+      espTimeUs: getUint64AsNumber(view, offset + 4),
+      ch2: view.getUint16(offset + 12, true),
+      ch3: view.getUint16(offset + 14, true),
     });
     offset += 16;
   }
+  acceptBatch(roundIndex, samples);
 }
 
-function resample(values, targetLength) {
-  if (values.length === targetLength) return Float32Array.from(values);
-  const output = new Float32Array(targetLength);
-  for (let index = 0; index < targetLength; index += 1) {
-    const position = index * (values.length - 1) / (targetLength - 1);
-    const left = Math.floor(position);
-    const right = Math.min(values.length - 1, left + 1);
-    const fraction = position - left;
-    output[index] = values[left] * (1 - fraction) + values[right] * fraction;
+function handleNotification(event) {
+  const view = event.target.value;
+  const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+  if (bytes.length < 3 || bytes[0] !== PROTOCOL.receiveHead) return;
+  if (sumChecksum(bytes.subarray(0, -1)) !== bytes[bytes.length - 1]) {
+    state.rejectedPackets += 1;
+    return;
   }
-  return output;
-}
-
-function prepareBaseFeatures(samples, metadata) {
-  const ch2 = resample(samples.map((sample) => sample.ch2), metadata.seqLen);
-  const ch3 = resample(samples.map((sample) => sample.ch3), metadata.seqLen);
-  const output = new Float32Array(metadata.seqLen * metadata.inputChannels);
-  for (let index = 0; index < metadata.seqLen; index += 1) {
-    const previous = index === 0 ? metadata.seqLen - 1 : index - 1;
-    const safeCh2 = Math.max(ch2[index] + 1e-6, 1e-6);
-    const safeCh3 = Math.max(ch3[index] + 1e-6, 1e-6);
-    const denominator = Math.max(ch3[index] + ch2[index] + 1e-6, 1e-6);
-    const features = [
-      ch2[index],
-      ch3[index],
-      Math.log(safeCh3 / safeCh2),
-      (ch3[index] - ch2[index]) / denominator,
-      ch2[index] - ch2[previous],
-      ch3[index] - ch3[previous],
-    ];
-    for (let channel = 0; channel < metadata.inputChannels; channel += 1) {
-      output[index * metadata.inputChannels + channel] = features[channel];
-    }
+  const packetType = bytes[1];
+  if (packetType === PROTOCOL.ledPacketType && bytes.length >= 5) {
+    state.ledOn = bytes[2] !== 0;
+    return;
   }
-  return output;
+  if (packetType === PROTOCOL.syncPacketType && bytes.length >= 7) {
+    state.ledOn = bytes[2] !== 0;
+    return;
+  }
+  if (!state.runActive) return;
+  if (packetType === PROTOCOL.adcBatchPacketType) {
+    parseAdcBatch(view);
+  } else if (packetType === PROTOCOL.adcPacketType) {
+    state.rejectedPackets += 1;
+  }
 }
 
 function normalizeFeatures(features, normalization) {
@@ -399,78 +429,303 @@ function normalizeFeatures(features, normalization) {
   return output;
 }
 
-function argmax(values) {
-  let bestIndex = 0;
-  for (let index = 1; index < values.length; index += 1) {
-    if (values[index] > values[bestIndex]) bestIndex = index;
+async function inferRound(samples) {
+  const prepared = window.NIRPreprocessing.prepareFeatures(samples, state.metadata.seqLen);
+  const predictions = [];
+  for (let index = 0; index < state.modelSessions.length; index += 1) {
+    const session = state.modelSessions[index];
+    const fold = state.metadata.folds[index];
+    const inputData = normalizeFeatures(prepared.features, fold.normalization);
+    const outputs = await session.run({
+      [session.inputNames[0]]: new ort.Tensor(
+        "float32",
+        inputData,
+        [1, state.metadata.seqLen, state.metadata.inputChannels],
+      ),
+    });
+    const raw = Number(outputs[session.outputNames[0]].data[0]);
+    const clamped = Math.max(0, Math.min(1, raw));
+    predictions.push(
+      state.metadata.targetMin
+      + clamped * (state.metadata.targetMax - state.metadata.targetMin),
+    );
   }
-  return bestIndex;
+  const concentration = predictions.reduce((total, value) => total + value, 0) / predictions.length;
+  return { concentration, alignment: prepared.alignment };
 }
 
-async function classifySamples() {
-  if (!state.metadata || state.modelSessions.length !== 5) {
-    ui.resultName.textContent = "采集成功";
-    ui.resultConfidence.textContent = "五个模型尚未全部加载";
-    return;
-  }
-  try {
-    ui.resultName.textContent = "计算中…";
-    const baseFeatures = prepareBaseFeatures(state.samples, state.metadata);
-    const voteCounts = new Array(state.metadata.labels.length).fill(0);
-    const foldVotes = [];
+function queueInference(runId, roundNumber, samples) {
+  const task = state.inferenceChain.then(
+    () => inferRound(samples),
+    () => inferRound(samples),
+  );
+  state.inferenceChain = task.catch(() => undefined);
+  state.inferencePromises.push(task);
+  task.then(({ concentration, alignment }) => {
+    if (runId !== state.runId) return;
+    const result = {
+      roundNumber,
+      timeSeconds: roundNumber * ACQUISITION.windowSeconds,
+      concentration,
+      periodSamples: alignment.periodSamples,
+    };
+    state.results.push(result);
+    state.results.sort((left, right) => left.roundNumber - right.roundNumber);
+    ui.resultName.textContent = `${concentration.toFixed(2)}%`;
+    ui.resultDetail.textContent = `第 ${roundNumber} 轮 · 五模型平均结果`;
+    ui.roundStatus.textContent = `已采集 ${state.rawRounds.length}/${state.plannedRounds} · 已计算 ${state.results.length}`;
+    ui.downloadButton.disabled = false;
+    drawChart();
+    log(`第 ${roundNumber} 轮完成：${concentration.toFixed(2)}%`);
+  }).catch((error) => {
+    if (runId !== state.runId) return;
+    ui.resultDetail.textContent = `第 ${roundNumber} 轮计算失败：${error.message}`;
+    log(`第 ${roundNumber} 轮推理失败：${error.stack || error.message}`);
+  });
+  return task;
+}
 
-    for (let index = 0; index < state.modelSessions.length; index += 1) {
-      const session = state.modelSessions[index];
-      const fold = state.metadata.folds[index];
-      const inputData = normalizeFeatures(baseFeatures, fold.normalization);
-      const inputName = session.inputNames[0];
-      const feeds = {
-        [inputName]: new ort.Tensor(
-          "float32",
-          inputData,
-          [1, state.metadata.seqLen, state.metadata.inputChannels],
-        ),
-      };
-      const outputs = await session.run(feeds);
-      const predictedIndex = argmax(outputs[session.outputNames[0]].data);
-      voteCounts[predictedIndex] += 1;
-      foldVotes.push(state.metadata.labels[predictedIndex]);
+async function cleanupHardware() {
+  if (state.cleanupPromise) return state.cleanupPromise;
+  state.cleanupPromise = (async () => {
+    if (isConnected()) {
+      try {
+        await writeCommand(PROTOCOL.adcCommand, [PROTOCOL.stopMode], false);
+      } catch (error) {
+        log(`停止 ADC 失败：${error.message}`);
+      }
+      try {
+        await setLed(false);
+      } catch (error) {
+        log(`关闭 LED 失败：${error.message}`);
+      }
+    }
+  })();
+  return state.cleanupPromise;
+}
+
+async function startCollection() {
+  if (!isConnected() || state.processing || !modelsReady()) return;
+  const plan = getDurationPlan(true);
+  if (!plan || plan.rounds < 1) return;
+
+  const runId = state.runId + 1;
+  state.runId = runId;
+  state.runActive = true;
+  state.processing = true;
+  state.abortRequested = false;
+  state.plannedRounds = plan.rounds;
+  state.currentRound = null;
+  state.cleanupPromise = null;
+  state.inferenceChain = Promise.resolve();
+  state.inferencePromises = [];
+  state.rawRounds = [];
+  state.results = [];
+  state.rejectedPackets = 0;
+  ui.resultName.textContent = "采集中…";
+  ui.resultDetail.textContent = `计划 ${plan.rounds} 轮，每轮接收 224 个有效点`;
+  ui.roundStatus.textContent = `0 / ${plan.rounds} 轮`;
+  drawChart();
+  updateControls();
+
+  try {
+    await configureHardware(plan.rounds);
+    let context = armRound(1);
+    await writeCommand(PROTOCOL.adcCommand, [PROTOCOL.continuousMode], false);
+    log(`开始连续检测：输入 ${plan.seconds} 秒，共 ${plan.rounds} 轮`);
+
+    for (let roundNumber = 1; roundNumber <= plan.rounds; roundNumber += 1) {
+      const samples = await context.completed;
+      if (!state.runActive || runId !== state.runId) throw new Error("检测已停止");
+      state.rawRounds.push({ roundNumber, samples });
+
+      await writeCommand(PROTOCOL.adcCommand, [PROTOCOL.stopMode], false);
+      let nextContext = null;
+      let nextStartPromise = null;
+      if (roundNumber < plan.rounds) {
+        nextContext = armRound(roundNumber + 1);
+        nextStartPromise = writeCommand(PROTOCOL.adcCommand, [PROTOCOL.continuousMode], false);
+      } else {
+        state.currentRound = null;
+      }
+
+      queueInference(runId, roundNumber, samples);
+      if (nextStartPromise) await nextStartPromise;
+      context = nextContext;
+
+      if (roundNumber === 1 || roundNumber === plan.rounds || roundNumber % 10 === 0) {
+        log(`采集进度：${roundNumber}/${plan.rounds} 轮，每轮 224 点`);
+      }
     }
 
-    const winnerIndex = argmax(voteCounts);
-    const winnerVotes = voteCounts[winnerIndex];
-    const voteThreshold = state.metadata.voteThreshold ?? 3;
-    ui.resultName.textContent = winnerVotes >= voteThreshold ? state.metadata.labels[winnerIndex] : "无法识别";
-    ui.resultConfidence.textContent = "";
-    log(`五模型投票：${foldVotes.join("、")}`);
-    log(`最终结果：${ui.resultName.textContent}（最高 ${winnerVotes}/5 票）`);
+    state.runActive = false;
+    await cleanupHardware();
+    ui.resultDetail.textContent = `采集完成，正在等待 ${state.inferencePromises.length - state.results.length} 轮计算`;
+    await Promise.allSettled(state.inferencePromises);
+    if (runId !== state.runId) return;
+
+    const latest = state.results[state.results.length - 1];
+    if (latest) ui.resultName.textContent = `${latest.concentration.toFixed(2)}%`;
+    ui.resultDetail.textContent = state.results.length === plan.rounds
+      ? `检测完成，共 ${plan.rounds} 轮`
+      : `检测完成：${state.results.length}/${plan.rounds} 轮计算成功`;
+    ui.roundStatus.textContent = `${state.results.length} / ${plan.rounds} 轮完成`;
+    log(`全部结束：采集 ${state.rawRounds.length} 轮，计算成功 ${state.results.length} 轮，无效包 ${state.rejectedPackets}`);
   } catch (error) {
-    ui.resultName.textContent = "推理失败";
-    ui.resultConfidence.textContent = error.message;
-    log(`推理失败：${error.stack || error.message}`);
+    state.runActive = false;
+    rejectCurrentRound(error);
+    await cleanupHardware();
+    await Promise.allSettled(state.inferencePromises);
+    if (state.abortRequested) {
+      ui.resultName.textContent = state.results.length ? `${state.results[state.results.length - 1].concentration.toFixed(2)}%` : "已停止";
+      ui.resultDetail.textContent = `检测已停止，完成 ${state.results.length}/${plan.rounds} 轮`;
+      log("用户停止了连续检测");
+    } else {
+      ui.resultName.textContent = "检测失败";
+      ui.resultDetail.textContent = error.message;
+      log(`检测失败：${error.stack || error.message}`);
+    }
+  } finally {
+    if (runId === state.runId) {
+      state.runActive = false;
+      state.processing = false;
+      state.currentRound = null;
+      updateControls();
+      drawChart();
+    }
+  }
+}
+
+async function stopCollection() {
+  if (!state.runActive) return;
+  state.abortRequested = true;
+  state.runActive = false;
+  rejectCurrentRound(new Error("用户停止检测"));
+  ui.stopButton.disabled = true;
+  ui.resultDetail.textContent = "正在停止 ADC、舵机和 LED…";
+  await cleanupHardware();
+}
+
+function drawChart() {
+  const canvas = ui.concentrationChart;
+  const rect = canvas.getBoundingClientRect();
+  if (rect.width < 10 || rect.height < 10) return;
+  const ratio = Math.min(window.devicePixelRatio || 1, 2);
+  const pixelWidth = Math.round(rect.width * ratio);
+  const pixelHeight = Math.round(rect.height * ratio);
+  if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+    canvas.width = pixelWidth;
+    canvas.height = pixelHeight;
+  }
+  const context = canvas.getContext("2d");
+  context.setTransform(ratio, 0, 0, ratio, 0, 0);
+  const width = rect.width;
+  const height = rect.height;
+  context.clearRect(0, 0, width, height);
+
+  const margin = { left: 48, right: 16, top: 16, bottom: 38 };
+  const plotWidth = Math.max(1, width - margin.left - margin.right);
+  const plotHeight = Math.max(1, height - margin.top - margin.bottom);
+  const xMaximum = Math.max(ACQUISITION.windowSeconds, state.plannedRounds * ACQUISITION.windowSeconds);
+  context.font = "12px Inter, Microsoft YaHei, sans-serif";
+  context.textBaseline = "middle";
+
+  for (let tick = 0; tick <= 5; tick += 1) {
+    const yValue = tick * 20;
+    const y = margin.top + plotHeight * (1 - yValue / 100);
+    context.strokeStyle = "#dce3ed";
+    context.lineWidth = 1;
+    context.beginPath();
+    context.moveTo(margin.left, y);
+    context.lineTo(width - margin.right, y);
+    context.stroke();
+    context.fillStyle = "#697386";
+    context.textAlign = "right";
+    context.fillText(`${yValue}%`, margin.left - 8, y);
+  }
+
+  for (let tick = 0; tick <= 5; tick += 1) {
+    const value = xMaximum * tick / 5;
+    const x = margin.left + plotWidth * tick / 5;
+    context.fillStyle = "#697386";
+    context.textAlign = tick === 0 ? "left" : tick === 5 ? "right" : "center";
+    context.fillText(formatSeconds(Number(value.toFixed(1))), x, height - 17);
+  }
+
+  context.strokeStyle = "#9eabbc";
+  context.beginPath();
+  context.moveTo(margin.left, margin.top);
+  context.lineTo(margin.left, margin.top + plotHeight);
+  context.lineTo(width - margin.right, margin.top + plotHeight);
+  context.stroke();
+
+  if (!state.results.length) {
+    context.fillStyle = "#929bad";
+    context.textAlign = "center";
+    context.fillText("等待浓度数据", margin.left + plotWidth / 2, margin.top + plotHeight / 2);
+    return;
+  }
+
+  const points = state.results.map((result) => ({
+    x: margin.left + plotWidth * result.timeSeconds / xMaximum,
+    y: margin.top + plotHeight * (1 - result.concentration / 100),
+  }));
+  context.strokeStyle = "#0b6bcb";
+  context.lineWidth = 2.5;
+  context.lineJoin = "round";
+  context.lineCap = "round";
+  context.beginPath();
+  points.forEach((point, index) => {
+    if (index === 0) context.moveTo(point.x, point.y);
+    else context.lineTo(point.x, point.y);
+  });
+  context.stroke();
+  context.fillStyle = "#087f5b";
+  for (const point of points) {
+    context.beginPath();
+    context.arc(point.x, point.y, 3.2, 0, Math.PI * 2);
+    context.fill();
   }
 }
 
 function downloadCsv() {
-  if (!state.samples.length) return;
-  const rows = ["Elapsed_ms,Sample_Index,ESP_Time_us,CH1_mV,CH2_mV,CH3_mV,Round_Index"];
-  for (const sample of state.samples) {
-    rows.push(`${sample.elapsedMs.toFixed(3)},${sample.sampleIndex},${sample.espTimeUs ?? ""},${sample.ch1 ?? ""},${sample.ch2},${sample.ch3},${sample.roundIndex}`);
+  if (!state.rawRounds.length) return;
+  const concentrationByRound = new Map(state.results.map((result) => [result.roundNumber, result.concentration]));
+  const rows = ["Round,Time_s,Concentration_percent,Sample_Index,ESP_Time_us,Elapsed_In_Round_ms,CH2_mV,CH3_mV,Device_Round_Index"];
+  for (const round of state.rawRounds) {
+    const concentration = concentrationByRound.get(round.roundNumber);
+    for (const sample of round.samples) {
+      rows.push([
+        round.roundNumber,
+        (round.roundNumber * ACQUISITION.windowSeconds).toFixed(1),
+        concentration === undefined ? "" : concentration.toFixed(6),
+        sample.sampleIndex,
+        sample.espTimeUs,
+        sample.elapsedInRoundMs.toFixed(3),
+        sample.ch2,
+        sample.ch3,
+        sample.roundIndex,
+      ].join(","));
+    }
   }
   const blob = new Blob(["\ufeff" + rows.join("\r\n")], { type: "text/csv;charset=utf-8" });
   const link = document.createElement("a");
   link.href = URL.createObjectURL(blob);
-  link.download = `measurement_${new Date().toISOString().replace(/[:.]/g, "-")}.csv`;
+  link.download = `concentration_${new Date().toISOString().replace(/[:.]/g, "-")}.csv`;
   link.click();
   URL.revokeObjectURL(link.href);
 }
 
-ui.connectButton.addEventListener("click", connectDevice);
-ui.startButton.addEventListener("click", startCollection);
-ui.stopButton.addEventListener("click", () => stopCollection(true));
-ui.disconnectButton.addEventListener("click", disconnectDevice);
+ui.connectButton.addEventListener("click", () => { void connectDevice(); });
+ui.startButton.addEventListener("click", () => { void startCollection(); });
+ui.stopButton.addEventListener("click", () => { void stopCollection(); });
+ui.disconnectButton.addEventListener("click", () => { void disconnectDevice(); });
 ui.downloadButton.addEventListener("click", downloadCsv);
+ui.durationInput.addEventListener("input", updateDurationHint);
+window.addEventListener("resize", () => window.requestAnimationFrame(drawChart));
 
 setConnected(false);
+updateDurationHint();
 showCompatibility();
-loadModel();
+drawChart();
+void loadModels();

@@ -4,15 +4,15 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#0b6bcb">
-  <title>近红外溶液识别</title>
-  <link rel="stylesheet" href="./styles.css">
+  <title>近红外浓度检测</title>
+  <link rel="stylesheet" href="./styles.css?v=20260826">
 </head>
 <body>
   <main class="app-shell">
     <header class="hero">
-      <p class="eyebrow">ESP32 · BLE · ONNX</p>
-      <h1>近红外溶液识别</h1>
-      <p class="subtitle">连接采集设备，一键采集并在浏览器本地完成识别。</p>
+      <p class="eyebrow">ESP32 · BLE · 五模型平均</p>
+      <h1>近红外浓度检测</h1>
+      <p class="subtitle">每轮采集 224 个有效点，并在手机浏览器本地实时计算浓度。</p>
     </header>
 
     <section class="card status-card">
@@ -28,20 +28,34 @@
     <section class="card controls">
       <button id="connectButton" class="button primary">连接 ESP32</button>
       <div class="measurement-row">
-        <label for="durationInput">采集时长</label>
+        <label for="durationInput">总采集时间</label>
         <div class="input-with-unit">
-          <input id="durationInput" type="number" min="500" max="10000" step="100" value="1800">
-          <span>ms</span>
+          <input id="durationInput" type="number" min="2" max="600" step="0.5" value="60" inputmode="decimal">
+          <span>秒</span>
         </div>
       </div>
-      <button id="startButton" class="button success" disabled>开始采集并识别</button>
-      <button id="stopButton" class="button danger" disabled>停止采集</button>
+      <p id="durationHint" class="hint">共 40 轮；最后一个结果位于 60 秒</p>
+      <button id="startButton" class="button success" disabled>开始连续检测</button>
+      <button id="stopButton" class="button danger" disabled>停止检测</button>
     </section>
 
-    <section class="card result-card">
-      <span class="label">识别结果</span>
+    <section class="card result-card" aria-live="polite">
+      <span class="label">当前浓度</span>
       <div id="resultName" class="result-name">等待采集</div>
-      <div id="resultConfidence" class="confidence">模型正在初始化…</div>
+      <div id="resultDetail" class="confidence">五个模型正在初始化…</div>
+    </section>
+
+    <section class="card chart-card">
+      <div class="chart-heading">
+        <div>
+          <span class="label">实时浓度曲线</span>
+          <strong>时间（秒）— 浓度（%）</strong>
+        </div>
+        <span id="roundStatus" class="round-status">0 / 0 轮</span>
+      </div>
+      <div class="chart-wrap">
+        <canvas id="concentrationChart" role="img" aria-label="浓度随时间变化曲线"></canvas>
+      </div>
     </section>
 
     <section class="card actions-card">
@@ -56,6 +70,7 @@
   </main>
 
   <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/ort.min.js"></script>
-  <script src="./app.js"></script>
+  <script src="./preprocessing.js?v=20260826"></script>
+  <script src="./app.js?v=20260826"></script>
 </body>
 </html>
