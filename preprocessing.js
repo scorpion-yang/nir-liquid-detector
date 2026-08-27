@@ -189,14 +189,14 @@
       return low + argmax(edgeScore.slice(low, high));
     });
     if (matched.slice(1).some((value, index) => value <= matched[index])) {
-      throw new Error("CH2 边界匹配结果不是严格递增序列");
+      throw new Error("CH2 boundary matching did not produce a strictly increasing sequence.");
     }
     return matched;
   }
 
   function trimSegment(values, start, end) {
     const trim = Math.max(1, roundHalfToEven((end - start) * 0.15));
-    if (end - trim - (start + trim) < 4) throw new Error(`滤光片分段过短：${start}:${end}`);
+    if (end - trim - (start + trim) < 4) throw new Error(`Filter segment is too short: ${start}:${end}`);
     return values.slice(start + trim, end - trim);
   }
 
@@ -214,14 +214,14 @@
 
   function alignFilterCycle(ch2Input, ch3Input, outputLength = 224) {
     if (ch2Input.length !== ch3Input.length || ch2Input.length <= 195) {
-      throw new Error("CH2/CH3 必须长度相同，且至少包含 196 个点");
+      throw new Error("CH2 and CH3 must have the same length and contain at least 196 samples.");
     }
     const ch2 = Float64Array.from(ch2Input);
     const ch3 = Float64Array.from(ch3Input);
     const ch3Edge = makeEdgeScore(ch3);
     const candidates = candidateBoundaries(ch3Edge);
     const ch3Path = bestBoundaryPath(candidates, ch3Edge) || gridFallback(ch3Edge);
-    if (!ch3Path) throw new Error("无法定位一个完整周期的 6 个滤光片切换边界");
+    if (!ch3Path) throw new Error("Could not locate six filter-transition boundaries for a complete cycle.");
     const ch2Path = matchSecondaryBoundaries(ch3Path, makeEdgeScore(ch2));
     const ch2Segments = [];
     const ch3Segments = [];
@@ -310,7 +310,7 @@
   }
 
   function prepareFeatures(samples, outputLength = 224) {
-    if (samples.length !== outputLength) throw new Error(`每轮必须恰好包含 ${outputLength} 个有效点`);
+    if (samples.length !== outputLength) throw new Error(`Each round must contain exactly ${outputLength} valid samples.`);
     const alignment = alignFilterCycle(
       samples.map((sample) => sample.ch2),
       samples.map((sample) => sample.ch3),

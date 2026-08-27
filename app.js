@@ -63,11 +63,11 @@ const state = {
 const ui = Object.fromEntries([
   "connectButton", "startButton", "stopButton", "disconnectButton", "downloadButton",
   "durationInput", "durationHint", "connectionText", "connectionDot", "compatibilityWarning",
-  "resultName", "resultDetail", "roundStatus", "concentrationChart", "logOutput",
+  "resultName", "resultDetail", "concentrationChart", "logOutput",
 ].map((id) => [id, document.getElementById(id)]));
 
 function log(message) {
-  const timestamp = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+  const timestamp = new Date().toLocaleTimeString("en-GB", { hour12: false });
   ui.logOutput.textContent += `[${timestamp}] ${message}\n`;
   ui.logOutput.scrollTop = ui.logOutput.scrollHeight;
 }
@@ -109,7 +109,7 @@ function updateControls() {
 }
 
 function setConnected(connected, name = "") {
-  ui.connectionText.textContent = connected ? `已连接：${name || BLE.deviceName}` : "未连接";
+  ui.connectionText.textContent = connected ? `Connected: ${name || BLE.deviceName}` : "Disconnected";
   ui.connectionDot.classList.toggle("online", connected);
   ui.connectionDot.classList.toggle("offline", !connected);
   if (!connected) state.ledOn = false;
@@ -118,8 +118,8 @@ function setConnected(connected, name = "") {
 
 function showCompatibility() {
   const messages = [];
-  if (!window.isSecureContext) messages.push("当前页面不是安全上下文，请通过 HTTPS 的 GitHub Pages 打开。");
-  if (!("bluetooth" in navigator)) messages.push("当前浏览器不支持 Web Bluetooth，请使用 Android Chrome 或 Windows Chrome/Edge。");
+  if (!window.isSecureContext) messages.push("This page is not running in a secure context. Open it through GitHub Pages over HTTPS.");
+  if (!("bluetooth" in navigator)) messages.push("This browser does not support Web Bluetooth. Use Chrome on Android or Chrome/Edge on Windows.");
   if (messages.length) {
     state.compatible = false;
     ui.compatibilityWarning.hidden = false;
@@ -151,10 +151,10 @@ function getDurationPlan(clampValue = false) {
 function updateDurationHint() {
   const plan = getDurationPlan(false);
   if (!plan) {
-    ui.durationHint.textContent = "请输入 2–600 秒";
+    ui.durationHint.textContent = "Enter a value from 2 to 600 seconds";
     return;
   }
-  ui.durationHint.textContent = `共 ${plan.rounds} 轮；最后一个结果位于 ${formatSeconds(plan.finalTime)} 秒`;
+  ui.durationHint.textContent = `${plan.rounds} rounds; final result at ${formatSeconds(plan.finalTime)} seconds`;
   if (!state.processing) {
     state.plannedRounds = plan.rounds;
     drawChart();
@@ -163,41 +163,41 @@ function updateDurationHint() {
 
 async function loadModels() {
   try {
-    if (!window.ort) throw new Error("ONNX Runtime Web 未加载，请检查网络连接");
-    if (!window.NIRPreprocessing) throw new Error("V8 数据预处理模块未加载");
+    if (!window.ort) throw new Error("ONNX Runtime Web did not load. Check your internet connection.");
+    if (!window.NIRPreprocessing) throw new Error("The V8 preprocessing module did not load.");
     ort.env.wasm.numThreads = 1;
     ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/";
     const response = await fetch("./model/metadata.json", { cache: "no-store" });
-    if (!response.ok) throw new Error(`模型元数据加载失败：HTTP ${response.status}`);
+    if (!response.ok) throw new Error(`Failed to load model metadata: HTTP ${response.status}`);
     state.metadata = await response.json();
     if (state.metadata.task !== "regression" || state.metadata.seqLen !== ACQUISITION.samplesPerRound) {
-      throw new Error("模型元数据与 224 点浓度检测流程不匹配");
+      throw new Error("The model metadata does not match the 224-sample concentration workflow.");
     }
     if (!Array.isArray(state.metadata.folds) || state.metadata.folds.length !== 5) {
-      throw new Error("模型元数据必须包含五个交叉验证模型");
+      throw new Error("The model metadata must contain five cross-validation models.");
     }
     state.modelSessions = [];
     for (let index = 0; index < state.metadata.folds.length; index += 1) {
-      ui.resultDetail.textContent = `正在加载模型 ${index + 1}/5…`;
+      ui.resultDetail.textContent = `Loading model ${index + 1}/5…`;
       const session = await ort.InferenceSession.create(state.metadata.folds[index].modelPath, {
         executionProviders: ["wasm"],
         graphOptimizationLevel: "all",
       });
       state.modelSessions.push(session);
     }
-    ui.resultDetail.textContent = "五个浓度模型已就绪";
-    log("V8 五折浓度模型加载完成");
+    ui.resultDetail.textContent = "All five concentration models are ready";
+    log("V8 five-fold concentration ensemble loaded");
   } catch (error) {
     state.modelSessions = [];
-    ui.resultDetail.textContent = "模型加载失败，请检查网络后刷新页面";
-    log(`模型加载失败：${error.message}`);
+    ui.resultDetail.textContent = "Model loading failed. Check your connection and refresh the page.";
+    log(`Model loading failed: ${error.message}`);
   }
   updateControls();
 }
 
 async function connectDevice() {
   try {
-    log("正在打开蓝牙设备选择器…");
+    log("Opening the Bluetooth device picker…");
     const device = await navigator.bluetooth.requestDevice({ filters: [{ services: [BLE.service] }] });
     state.device = device;
     device.addEventListener("gattserverdisconnected", handleDisconnected);
@@ -213,14 +213,14 @@ async function connectDevice() {
       await state.statusCharacteristic.startNotifications();
       state.statusCharacteristic.addEventListener("characteristicvaluechanged", handleNotification);
     } catch (error) {
-      log(`状态特征订阅跳过：${error.message}`);
+      log(`Status characteristic unavailable: ${error.message}`);
     }
 
     setConnected(true, device.name);
-    log(`BLE 已连接：${device.name || "未命名设备"}`);
+    log(`BLE connected: ${device.name || "Unnamed device"}`);
     await writeCommand(PROTOCOL.syncCommand, [], false);
   } catch (error) {
-    log(`连接失败：${error.message}`);
+    log(`Connection failed: ${error.message}`);
     setConnected(false);
   }
 }
@@ -236,14 +236,14 @@ function rejectCurrentRound(error) {
 function handleDisconnected() {
   state.runActive = false;
   state.abortRequested = true;
-  rejectCurrentRound(new Error("ESP32 蓝牙连接已断开"));
+  rejectCurrentRound(new Error("The ESP32 Bluetooth connection was lost."));
   state.server = null;
   state.commandCharacteristic = null;
   state.dataCharacteristic = null;
   state.statusCharacteristic = null;
   state.ledPending = false;
   setConnected(false);
-  log("ESP32 已断开");
+  log("ESP32 disconnected");
 }
 
 async function disconnectDevice() {
@@ -253,22 +253,22 @@ async function disconnectDevice() {
 }
 
 async function writeCommand(commandId, params, writeLog = true) {
-  if (!state.commandCharacteristic) throw new Error("命令特征不可用");
+  if (!state.commandCharacteristic) throw new Error("The command characteristic is unavailable.");
   const frame = buildCommand(commandId, params);
   await state.commandCharacteristic.writeValueWithResponse(frame);
   if (writeLog) {
-    log(`发送指令：${Array.from(frame, (value) => value.toString(16).padStart(2, "0")).join(" ")}`);
+    log(`Command sent: ${Array.from(frame, (value) => value.toString(16).padStart(2, "0")).join(" ")}`);
   }
 }
 
 async function setLed(enabled) {
-  if (!isConnected()) throw new Error("设备未连接");
-  if (state.ledPending) throw new Error("LED 指令正在执行");
+  if (!isConnected()) throw new Error("The device is not connected.");
+  if (state.ledPending) throw new Error("An LED command is already in progress.");
   state.ledPending = true;
   try {
     await writeCommand(PROTOCOL.ledCommand, [enabled ? 1 : 0], false);
     state.ledOn = enabled;
-    log(`LED ${enabled ? "已开启" : "已关闭"}`);
+    log(`LED ${enabled ? "on" : "off"}`);
   } finally {
     state.ledPending = false;
   }
@@ -294,7 +294,7 @@ async function configureHardware(rounds) {
     ACQUISITION.servoSpeedPercent,
   ];
   await writeCommand(PROTOCOL.servoConfigCommand, params, false);
-  log(`采集参数已设置：每轮 1500 ms，${rounds} 轮，舵机速度 20%`);
+  log(`Acquisition configured: 1500 ms per round, ${rounds} rounds, servo speed 20%`);
 }
 
 function armRound(roundNumber) {
@@ -319,11 +319,10 @@ function armRound(roundNumber) {
     if (!context.accepting) return;
     context.accepting = false;
     context.reject(new Error(
-      `第 ${roundNumber} 轮等待超时：只收到 ${context.samplesByIndex.size}/${ACQUISITION.samplesPerRound} 个有效点`,
+      `Round ${roundNumber} timed out: received only ${context.samplesByIndex.size}/${ACQUISITION.samplesPerRound} valid samples`,
     ));
   }, ACQUISITION.roundTimeoutMs);
   state.currentRound = context;
-  ui.roundStatus.textContent = `第 ${roundNumber}/${state.plannedRounds} 轮 · 0/224 点`;
   return context;
 }
 
@@ -352,7 +351,6 @@ function acceptBatch(roundIndex, samples) {
   }
 
   const pointCount = context.samplesByIndex.size;
-  ui.roundStatus.textContent = `第 ${context.roundNumber}/${state.plannedRounds} 轮 · ${pointCount}/224 点`;
   if (pointCount !== ACQUISITION.samplesPerRound) return;
 
   const ordered = [];
@@ -472,15 +470,14 @@ function queueInference(runId, roundNumber, samples) {
     state.results.push(result);
     state.results.sort((left, right) => left.roundNumber - right.roundNumber);
     ui.resultName.textContent = `${concentration.toFixed(2)}%`;
-    ui.resultDetail.textContent = `第 ${roundNumber} 轮 · 五模型平均结果`;
-    ui.roundStatus.textContent = `已采集 ${state.rawRounds.length}/${state.plannedRounds} · 已计算 ${state.results.length}`;
+    ui.resultDetail.textContent = `Round ${roundNumber} · five-model mean`;
     ui.downloadButton.disabled = false;
     drawChart();
-    log(`第 ${roundNumber} 轮完成：${concentration.toFixed(2)}%`);
+    log(`Round ${roundNumber} complete: ${concentration.toFixed(2)}%`);
   }).catch((error) => {
     if (runId !== state.runId) return;
-    ui.resultDetail.textContent = `第 ${roundNumber} 轮计算失败：${error.message}`;
-    log(`第 ${roundNumber} 轮推理失败：${error.stack || error.message}`);
+    ui.resultDetail.textContent = `Round ${roundNumber} calculation failed: ${error.message}`;
+    log(`Round ${roundNumber} inference failed: ${error.stack || error.message}`);
   });
   return task;
 }
@@ -492,12 +489,12 @@ async function cleanupHardware() {
       try {
         await writeCommand(PROTOCOL.adcCommand, [PROTOCOL.stopMode], false);
       } catch (error) {
-        log(`停止 ADC 失败：${error.message}`);
+        log(`Failed to stop the ADC: ${error.message}`);
       }
       try {
         await setLed(false);
       } catch (error) {
-        log(`关闭 LED 失败：${error.message}`);
+        log(`Failed to turn off the LED: ${error.message}`);
       }
     }
   })();
@@ -522,9 +519,8 @@ async function startCollection() {
   state.rawRounds = [];
   state.results = [];
   state.rejectedPackets = 0;
-  ui.resultName.textContent = "采集中…";
-  ui.resultDetail.textContent = `计划 ${plan.rounds} 轮，每轮接收 224 个有效点`;
-  ui.roundStatus.textContent = `0 / ${plan.rounds} 轮`;
+  ui.resultName.textContent = "Acquiring…";
+  ui.resultDetail.textContent = `${plan.rounds} planned rounds · 224 valid samples per round`;
   drawChart();
   updateControls();
 
@@ -532,11 +528,11 @@ async function startCollection() {
     await configureHardware(plan.rounds);
     let context = armRound(1);
     await writeCommand(PROTOCOL.adcCommand, [PROTOCOL.continuousMode], false);
-    log(`开始连续检测：输入 ${plan.seconds} 秒，共 ${plan.rounds} 轮`);
+    log(`Monitoring started: ${plan.seconds} seconds, ${plan.rounds} rounds`);
 
     for (let roundNumber = 1; roundNumber <= plan.rounds; roundNumber += 1) {
       const samples = await context.completed;
-      if (!state.runActive || runId !== state.runId) throw new Error("检测已停止");
+      if (!state.runActive || runId !== state.runId) throw new Error("Monitoring has stopped.");
       state.rawRounds.push({ roundNumber, samples });
 
       await writeCommand(PROTOCOL.adcCommand, [PROTOCOL.stopMode], false);
@@ -554,36 +550,35 @@ async function startCollection() {
       context = nextContext;
 
       if (roundNumber === 1 || roundNumber === plan.rounds || roundNumber % 10 === 0) {
-        log(`采集进度：${roundNumber}/${plan.rounds} 轮，每轮 224 点`);
+        log(`Acquisition progress: ${roundNumber}/${plan.rounds} rounds, 224 samples per round`);
       }
     }
 
     state.runActive = false;
     await cleanupHardware();
-    ui.resultDetail.textContent = `采集完成，正在等待 ${state.inferencePromises.length - state.results.length} 轮计算`;
+    ui.resultDetail.textContent = `Acquisition complete · waiting for ${state.inferencePromises.length - state.results.length} calculations`;
     await Promise.allSettled(state.inferencePromises);
     if (runId !== state.runId) return;
 
     const latest = state.results[state.results.length - 1];
     if (latest) ui.resultName.textContent = `${latest.concentration.toFixed(2)}%`;
     ui.resultDetail.textContent = state.results.length === plan.rounds
-      ? `检测完成，共 ${plan.rounds} 轮`
-      : `检测完成：${state.results.length}/${plan.rounds} 轮计算成功`;
-    ui.roundStatus.textContent = `${state.results.length} / ${plan.rounds} 轮完成`;
-    log(`全部结束：采集 ${state.rawRounds.length} 轮，计算成功 ${state.results.length} 轮，无效包 ${state.rejectedPackets}`);
+      ? `Monitoring complete · ${plan.rounds} rounds`
+      : `Monitoring complete · ${state.results.length}/${plan.rounds} calculations succeeded`;
+    log(`Run complete: ${state.rawRounds.length} rounds acquired, ${state.results.length} calculated, ${state.rejectedPackets} invalid packets`);
   } catch (error) {
     state.runActive = false;
     rejectCurrentRound(error);
     await cleanupHardware();
     await Promise.allSettled(state.inferencePromises);
     if (state.abortRequested) {
-      ui.resultName.textContent = state.results.length ? `${state.results[state.results.length - 1].concentration.toFixed(2)}%` : "已停止";
-      ui.resultDetail.textContent = `检测已停止，完成 ${state.results.length}/${plan.rounds} 轮`;
-      log("用户停止了连续检测");
+      ui.resultName.textContent = state.results.length ? `${state.results[state.results.length - 1].concentration.toFixed(2)}%` : "Stopped";
+      ui.resultDetail.textContent = `Monitoring stopped · ${state.results.length}/${plan.rounds} rounds complete`;
+      log("Monitoring stopped by the user");
     } else {
-      ui.resultName.textContent = "检测失败";
+      ui.resultName.textContent = "Monitoring failed";
       ui.resultDetail.textContent = error.message;
-      log(`检测失败：${error.stack || error.message}`);
+      log(`Monitoring failed: ${error.stack || error.message}`);
     }
   } finally {
     if (runId === state.runId) {
@@ -600,9 +595,9 @@ async function stopCollection() {
   if (!state.runActive) return;
   state.abortRequested = true;
   state.runActive = false;
-  rejectCurrentRound(new Error("用户停止检测"));
+  rejectCurrentRound(new Error("Monitoring stopped by the user."));
   ui.stopButton.disabled = true;
-  ui.resultDetail.textContent = "正在停止 ADC、舵机和 LED…";
+  ui.resultDetail.textContent = "Stopping the ADC, servo, and LED…";
   await cleanupHardware();
 }
 
@@ -623,11 +618,11 @@ function drawChart() {
   const height = rect.height;
   context.clearRect(0, 0, width, height);
 
-  const margin = { left: 48, right: 16, top: 16, bottom: 38 };
+  const margin = { left: 78, right: 18, top: 16, bottom: 66 };
   const plotWidth = Math.max(1, width - margin.left - margin.right);
   const plotHeight = Math.max(1, height - margin.top - margin.bottom);
   const xMaximum = Math.max(ACQUISITION.windowSeconds, state.plannedRounds * ACQUISITION.windowSeconds);
-  context.font = "12px Inter, Microsoft YaHei, sans-serif";
+  context.font = "12px Inter, Arial, sans-serif";
   context.textBaseline = "middle";
 
   for (let tick = 0; tick <= 5; tick += 1) {
@@ -649,20 +644,32 @@ function drawChart() {
     const x = margin.left + plotWidth * tick / 5;
     context.fillStyle = "#697386";
     context.textAlign = tick === 0 ? "left" : tick === 5 ? "right" : "center";
-    context.fillText(formatSeconds(Number(value.toFixed(1))), x, height - 17);
+    context.fillText(formatSeconds(Number(value.toFixed(1))), x, margin.top + plotHeight + 18);
   }
 
-  context.strokeStyle = "#9eabbc";
+  context.strokeStyle = "#344054";
+  context.lineWidth = 1.4;
   context.beginPath();
   context.moveTo(margin.left, margin.top);
   context.lineTo(margin.left, margin.top + plotHeight);
   context.lineTo(width - margin.right, margin.top + plotHeight);
   context.stroke();
 
+  context.save();
+  context.fillStyle = "#172033";
+  context.font = "600 13px Inter, Arial, sans-serif";
+  context.textAlign = "center";
+  context.textBaseline = "middle";
+  context.fillText("Cumulative time (s)", margin.left + plotWidth / 2, height - 13);
+  context.translate(17, margin.top + plotHeight / 2);
+  context.rotate(-Math.PI / 2);
+  context.fillText("Predicted concentration (%)", 0, 0);
+  context.restore();
+
   if (!state.results.length) {
     context.fillStyle = "#929bad";
     context.textAlign = "center";
-    context.fillText("等待浓度数据", margin.left + plotWidth / 2, margin.top + plotHeight / 2);
+    context.fillText("Waiting for concentration data", margin.left + plotWidth / 2, margin.top + plotHeight / 2);
     return;
   }
 
