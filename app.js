@@ -621,7 +621,10 @@ function drawChart() {
   const margin = { left: 78, right: 18, top: 16, bottom: 66 };
   const plotWidth = Math.max(1, width - margin.left - margin.right);
   const plotHeight = Math.max(1, height - margin.top - margin.bottom);
-  const xMaximum = Math.max(ACQUISITION.windowSeconds, state.plannedRounds * ACQUISITION.windowSeconds);
+  const latestResultTime = state.results.length
+    ? state.results[state.results.length - 1].timeSeconds
+    : ACQUISITION.windowSeconds;
+  const xMaximum = Math.max(ACQUISITION.windowSeconds, latestResultTime);
   context.font = "12px Inter, Arial, sans-serif";
   context.textBaseline = "middle";
 
