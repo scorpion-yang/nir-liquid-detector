@@ -3,70 +3,26 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#0b6bcb">
-  <title>NIR Concentration Monitor</title>
-  <link rel="stylesheet" href="./styles.css?v=20260827-2">
+  <meta name="theme-color" content="#223643">
+  <meta name="description" content="MoPod mobile near-infrared sensing application">
+  <title>MoPod · V5</title>
+  <link rel="stylesheet" href="./styles.css?v=5.0">
 </head>
 <body>
-  <main class="app-shell">
-    <header class="hero">
-      <p class="eyebrow">ESP32 · BLE · FIVE-MODEL ENSEMBLE</p>
-      <h1>NIR Concentration Monitor</h1>
-      <p class="subtitle">Collects 224 valid samples per round and calculates concentration locally in your mobile browser.</p>
+  <div class="app-shell">
+    <header class="app-header">
+      <button id="back" class="icon-button" aria-label="Back to Home" hidden></button>
+      <a class="brand" href="#/home" aria-label="MoPod Home"><svg viewBox="0 0 48 32" aria-hidden="true"><path d="M2 24C10 40 10-12 17 6S20 43 27 16 33-4 37 14 40 30 46 23"/></svg><span>MoPod</span></a>
+      <button id="bluetooth" class="icon-button bluetooth" aria-label="Connect Bluetooth device"></button>
+      <a id="menu" class="icon-button" href="#/settings" aria-label="Settings"></a>
     </header>
-
-    <section class="card status-card">
-      <div>
-        <span class="label">Device status</span>
-        <strong id="connectionText">Disconnected</strong>
-      </div>
-      <span id="connectionDot" class="dot offline" aria-hidden="true"></span>
-    </section>
-
-    <section id="compatibilityWarning" class="notice warning" hidden></section>
-
-    <section class="card controls">
-      <button id="connectButton" class="button primary">Connect to ESP32</button>
-      <div class="measurement-row">
-        <label for="durationInput">Total acquisition time</label>
-        <div class="input-with-unit">
-          <input id="durationInput" type="number" min="2" max="600" step="0.5" value="60" inputmode="decimal">
-          <span>sec</span>
-        </div>
-      </div>
-      <p id="durationHint" class="hint">40 rounds; final result at 60 seconds</p>
-      <button id="startButton" class="button success" disabled>Start Monitoring</button>
-      <button id="stopButton" class="button danger" disabled>Stop Monitoring</button>
-    </section>
-
-    <section class="card result-card" aria-live="polite">
-      <span class="label">Current concentration</span>
-      <div id="resultName" class="result-name">Ready</div>
-      <div id="resultDetail" class="confidence">Initializing five models…</div>
-    </section>
-
-    <section class="card chart-card">
-      <div class="chart-heading">
-        <span class="label">Live concentration curve</span>
-      </div>
-      <div class="chart-wrap">
-        <canvas id="concentrationChart" role="img" aria-label="Concentration over time chart"></canvas>
-      </div>
-    </section>
-
-    <section class="card actions-card">
-      <button id="downloadButton" class="button secondary" disabled>Download CSV</button>
-      <button id="disconnectButton" class="button ghost" disabled>Disconnect</button>
-    </section>
-
-    <details class="card log-card">
-      <summary>Activity log</summary>
-      <pre id="logOutput"></pre>
-    </details>
-  </main>
-
+    <main id="content" tabindex="-1"></main>
+    <nav id="navigation" class="bottom-navigation" aria-label="Main navigation"></nav>
+  </div>
+  <div id="toast" class="toast" role="status" hidden></div>
+  <dialog id="confirmDialog"><form method="dialog"><h2 id="confirmTitle">Confirm</h2><p id="confirmMessage"></p><div class="dialog-actions"><button value="cancel" class="button secondary">Cancel</button><button value="confirm" class="button danger">Confirm</button></div></form></dialog>
+  <script src="./preprocessing.js?v=5.0"></script>
   <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/ort.min.js"></script>
-  <script src="./preprocessing.js?v=20260827-2"></script>
-  <script src="./app.js?v=20260827-3"></script>
+  <script type="module" src="./app.js?v=5.0"></script>
 </body>
 </html>

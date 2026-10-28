@@ -1,741 +1,271 @@
-"use strict";
+import {icon,escapeHTML as esc,plot,download,csvCell} from './ui.js';
+import {MoPodDevice,abortError} from './device.js';
+import {ConcentrationModels} from './models.js';
+import {RecordStore} from './storage.js';
+import {APPLICATIONS,STATES,ApplicationModels,demoResult,normalizeResult} from './results.js';
 
-const BLE = Object.freeze({
-  deviceName: "nimble-ble-spp-svr",
-  service: "0000abf0-0000-1000-8000-00805f9b34fb",
-  command: "0000abf1-0000-1000-8000-00805f9b34fb",
-  data: "0000abf2-0000-1000-8000-00805f9b34fb",
-  status: "0000abf3-0000-1000-8000-00805f9b34fb",
-});
-
-const PROTOCOL = Object.freeze({
-  sendHead: 0xa5,
-  receiveHead: 0x5a,
-  ledCommand: 0x10,
-  servoTypeCommand: 0x24,
-  servoConfigCommand: 0x25,
-  adcCommand: 0x30,
-  syncCommand: 0x40,
-  adcPacketType: 0x01,
-  adcBatchPacketType: 0x07,
-  ledPacketType: 0x02,
-  syncPacketType: 0x04,
-  stopMode: 0x00,
-  continuousMode: 0x02,
-  servo360Mode: 0x01,
-});
-
-const ACQUISITION = Object.freeze({
-  samplesPerRound: 224,
-  windowSeconds: 1.5,
-  firmwareDurationMs: 1500,
-  servoSpeedPercent: 20,
-  roundTimeoutMs: 4500,
-  minimumTotalSeconds: 2,
-  maximumTotalSeconds: 600,
-});
-
-const state = {
-  compatible: true,
-  device: null,
-  server: null,
-  commandCharacteristic: null,
-  dataCharacteristic: null,
-  statusCharacteristic: null,
-  ledOn: false,
-  ledPending: false,
-  modelSessions: [],
-  metadata: null,
-  runId: 0,
-  runActive: false,
-  processing: false,
-  abortRequested: false,
-  plannedRounds: 0,
-  currentRound: null,
-  cleanupPromise: null,
-  inferenceChain: Promise.resolve(),
-  inferencePromises: [],
-  rawRounds: [],
-  results: [],
-  rejectedPackets: 0,
-};
-
-const ui = Object.fromEntries([
-  "connectButton", "startButton", "stopButton", "disconnectButton", "downloadButton",
-  "durationInput", "durationHint", "connectionText", "connectionDot", "compatibilityWarning",
-  "resultName", "resultDetail", "concentrationChart", "logOutput",
-].map((id) => [id, document.getElementById(id)]));
-
-function log(message) {
-  const timestamp = new Date().toLocaleTimeString("en-GB", { hour12: false });
-  ui.logOutput.textContent += `[${timestamp}] ${message}\n`;
-  ui.logOutput.scrollTop = ui.logOutput.scrollHeight;
+const device=new MoPodDevice(), models=new ConcentrationModels(), store=new RecordStore(), applications=new ApplicationModels();
+const content=document.querySelector('#content');
+const defaults={keepAwake:true,autoSave:true,demo:false};
+let settings={...defaults};
+try{settings={...defaults,...JSON.parse(localStorage.getItem('mopod-v5-settings')||'{}')};}catch{}
+let route=[], records=[], storageReady=false, activeRecord=null, quick=null, appJob=null, wakeLock=null, toastTimer;
+let historyType='all', historyDate='all';
+const demoStates={}, logs=[];
+const now=()=>Date.now();
+const dateText=time=>new Date(time).toLocaleString('en-GB',{day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'});
+const recordName=record=>record.type==='quick'?'Quick Scan':APPLICATIONS[record.type]?.name||'Detection';
+const button=(action,label,style='primary',glyph='',disabled=false)=>`<button class="button ${style}" data-action="${action}" ${disabled?'disabled':''}>${glyph?icon(glyph):''}${label}</button>`;
+function toast(message){clearTimeout(toastTimer);const t=document.querySelector('#toast');t.textContent=message;t.hidden=false;toastTimer=setTimeout(()=>t.hidden=true,4800);}
+function log(message){logs.push(`${new Date().toLocaleTimeString('en-GB')} ${message}`);if(logs.length>100)logs.shift();}
+function busy(){return Boolean(quick?.processing||appJob);}
+function saveSettings(){try{localStorage.setItem('mopod-v5-settings',JSON.stringify(settings));}catch{toast('Settings could not be saved in this browser.');}}
+async function confirmAction(title,message){
+  const dialog=document.querySelector('#confirmDialog');document.querySelector('#confirmTitle').textContent=title;document.querySelector('#confirmMessage').textContent=message;
+  dialog.returnValue='cancel';dialog.showModal();return new Promise(resolve=>dialog.addEventListener('close',()=>resolve(dialog.returnValue==='confirm'),{once:true}));
 }
-
-function sumChecksum(bytes) {
-  let total = 0;
-  for (const value of bytes) total = (total + value) & 0xff;
-  return total;
+function go(path){location.hash='/'+path;}
+function getRoute(){return (location.hash.slice(1)||'/home').replace(/^\//,'').split('/').filter(Boolean);}
+function renderNavigation(){
+  const current=route[0], active=current==='history'?'history':current==='models'?'models':current==='settings'?'settings':'home';
+  document.querySelector('#navigation').innerHTML=[['home','analysis','Analysis'],['history','history','History'],['models','model','Model'],['settings','settings','Settings']].map(([path,glyph,label])=>`<a href="#/${path}" ${active===path?'class="active" aria-current="page"':''}>${icon(glyph)}<span>${label}</span></a>`).join('');
+  const back=document.querySelector('#back');back.hidden=current==='home';back.innerHTML=icon('back');
+  const bt=document.querySelector('#bluetooth');bt.innerHTML=icon('bluetooth');bt.classList.toggle('connected',device.connected);bt.classList.toggle('connecting',device.status==='connecting');bt.disabled=busy()||device.status==='connecting';bt.title=device.connected?'Device connected':'Connect device';
+  document.querySelector('#menu').innerHTML=icon('more');
 }
-
-function buildCommand(commandId, params = []) {
-  const frame = new Uint8Array(4 + params.length);
-  frame[0] = PROTOCOL.sendHead;
-  frame[1] = commandId;
-  frame[2] = params.length;
-  frame.set(params, 3);
-  frame[frame.length - 1] = sumChecksum(frame.subarray(0, -1));
-  return frame;
+function deviceStrip(){return `<section class="card connection-strip"><span class="dot ${device.connected?'online':''}" style="${device.connected?'background:#32c558':''}"></span><div><strong class="small">${device.status==='connecting'?'Connecting…':device.connected?'Device connected':'Device disconnected'}</strong><div class="device-name muted">${esc(device.name||'Connect your MoPod')}</div></div>${!device.connected?`<button class="inline-link" data-action="connect" ${busy()?'disabled':''}>Connect</button>`:''}</section>`;}
+function devicePicture(){return `<div class="device-drawing" aria-hidden="true"><svg viewBox="0 0 100 110"><defs><linearGradient id="deviceFront" x2="1" y2="1"><stop stop-color="#fff"/><stop offset="1" stop-color="#cdd4d8"/></linearGradient></defs><path d="m10 19 42-9 37 12-1 69-40 11-36-16Z" fill="url(#deviceFront)" stroke="#c1cbd1"/><path d="m10 19 38 14 41-11M48 33v69" fill="none" stroke="#bac6cc"/><ellipse cx="51" cy="21" rx="6" ry="2.5" fill="#1ba5f5"/><circle cx="67" cy="56" r="3" fill="#28647a"/><circle cx="61" cy="85" r="4" fill="none" stroke="#a8b7c0"/><circle cx="74" cy="82" r="4" fill="none" stroke="#a8b7c0"/><path d="M20 43v4m7-2v4m7-2v4M20 53v4m7-2v4m7-2v4M20 63v4m7-2v4m7-2v4" stroke="#7e8e99" stroke-width="2"/></svg></div>`;}
+function homePage(){
+  return `<button class="card device-card" data-action="device-info">${devicePicture()}<div class="device-body"><span class="device-status ${device.connected?'connected':''}"><span class="dot"></span>${device.status==='connecting'?'Connecting…':device.connected?'Device connected':'Device disconnected'}</span><span class="device-name">${esc(device.name||'MoPod')}</span><span class="telemetry"><span>Battery —</span><span>Temp —</span></span></div>${icon('chevron')}</button><h1 class="section-title">Application scenarios</h1><section class="scenarios" aria-label="Application scenarios">${Object.entries(APPLICATIONS).map(([key,app])=>`<a class="card scenario-card ${key}" href="#/application/${key}">${icon(app.icon)}<strong>${app.name}</strong><span>${app.subtitle}</span></a>`).join('')}</section><a class="button primary quick-entry" href="#/quick">${icon('play')}Quick Scan</a>${settings.demo?'<div class="notice"><span class="demo-badge">Demo Mode</span> Application results are illustrative.</div>':''}`;
 }
-
-function isConnected() {
-  return Boolean(state.server?.connected);
+function quickPage(){return `<h1 class="page-title">Quick Scan</h1><p class="subtitle">Real-time concentration detection</p>${deviceStrip()}<section class="card controls">${button('start-quick','Start Detection','primary','play',busy()||!device.connected||!models.ready)}${button('stop-quick','Stop Detection','danger','stop',!quick?.running)}</section><section class="card quick-result" aria-live="polite"><span class="label">Detection result</span><div id="quickValue" class="result-value"></div><div id="quickDetail" class="quick-detail"></div></section><section class="card chart-card"><h2>Concentration over time</h2><canvas class="chart" id="quickChart" aria-label="Predicted concentration over cumulative time" role="img"></canvas>${button('export-quick','Download CSV','secondary export-button','download',!quick?.record?.points.length)}</section><div id="quickNotice"></div><details class="card"><summary>Activity log</summary><pre class="activity-log">${esc(logs.join('\n'))}</pre></details>`;}
+function updateQuick(){
+  if(route[0]!=='quick')return;
+  const points=quick?.record?.points||[],latest=points.at(-1);
+  document.querySelector('#quickValue').textContent=latest?`${latest.concentration.toFixed(2)}%`:quick?.running?'Detecting…':'Ready';
+  let detail=latest?'Predicted concentration':quick?.processing?'Waiting for concentration data':'Tap Start Detection to begin';
+  if(!models.ready&&!quick?.processing)detail=models.state==='loading'?'Preparing detection…':models.state==='error'?'Detection unavailable':'Preparing detection…';
+  document.querySelector('#quickDetail').innerHTML=`<span>${esc(detail)}</span><span>${latest?`${latest.timeSeconds.toFixed(1)} s`:''}</span>`;
+  document.querySelector('[data-action="start-quick"]').disabled=busy()||!device.connected||!models.ready;
+  document.querySelector('[data-action="stop-quick"]').disabled=!quick?.running;
+  document.querySelector('[data-action="export-quick"]').disabled=!points.length;
+  const message=quick?.error||models.error||'';
+  document.querySelector('#quickNotice').innerHTML=message?`<p class="notice error">${esc(message)}</p>`:'';
+  plot(document.querySelector('#quickChart'),points);
 }
-
-function modelsReady() {
-  return Boolean(state.metadata)
-    && state.modelSessions.length === 5
-    && state.modelSessions.length === state.metadata.folds.length;
+function selectedResult(type){return settings.demo?demoResult(type,demoStates[type]):applications.results.get(type)||normalizeResult(type);}
+function resultCard(result){
+  const app=APPLICATIONS[result.type], state=STATES[result.type][result.status];
+  const sampleLabel=result.type==='water'&&!['detected','high'].includes(result.status)?'Target Contaminant':app.sampleLabel;
+  return `<section class="card application-result tone-${state.tone}" aria-live="polite"><div class="sample-block"><span class="label">${sampleLabel}</span><div class="sample-name">${esc(result.sampleName)}</div></div><span class="label assessment-label">${app.assessmentLabel}</span><div class="state-symbol">${icon(state.icon)}</div><h2 class="state-title">${state.label}</h2><p class="result-description">${state.description}</p>${result.concentration?`<div class="concentration-inset"><span class="label">${result.type==='safety'?esc(result.concentration.analyte)+' Concentration':'Predicted Concentration'}</span><strong>${result.concentration.value.toFixed(1)}</strong> <small>${result.concentration.unit}</small></div>`:''}<div class="result-source">${result.source==='demo'?'Illustrative result':result.status===app.fallback?'No verified result available':'Model prediction'}</div></section>`;
 }
-
-function updateControls() {
-  const connected = isConnected();
-  ui.connectButton.disabled = connected || state.processing || !state.compatible;
-  ui.startButton.disabled = !connected || !modelsReady() || state.processing;
-  ui.stopButton.disabled = !state.runActive;
-  ui.disconnectButton.disabled = !connected;
-  ui.durationInput.disabled = state.processing;
-  ui.downloadButton.disabled = state.results.length === 0;
+function applicationPage(type){
+  if(!Object.hasOwn(APPLICATIONS,type))return notFound();
+  const app=APPLICATIONS[type];
+  const result=selectedResult(type);
+  return `<div class="result-page"><div class="heading-row"><div class="icon-tile ${type}">${icon(app.icon)}</div><h1>${app.title}</h1>${settings.demo?'<span class="demo-badge">Demo Mode</span>':''}</div>${resultCard(result)}<div class="result-actions">${button('scan-'+type,appJob?.type===type?'Detecting…':'Scan Again','primary','reload',busy())}${button('home','Back to Home','secondary','home')}</div></div>`;
 }
-
-function setConnected(connected, name = "") {
-  ui.connectionText.textContent = connected ? `Connected: ${name || BLE.deviceName}` : "Disconnected";
-  ui.connectionDot.classList.toggle("online", connected);
-  ui.connectionDot.classList.toggle("offline", !connected);
-  if (!connected) state.ledOn = false;
-  updateControls();
+function historyPage(){
+  const filtered=records.filter(r=>(historyType==='all'||r.type===historyType)&&(historyDate==='all'||new Date(r.startedAt).toDateString()===new Date(historyDate).toDateString()));
+  const dates=[...new Set(records.map(r=>new Date(r.startedAt).toLocaleDateString('en-CA')))];
+  return `<div class="title-actions"><h1 class="page-title">History</h1><button class="button secondary" data-action="filter">Filter</button></div><div class="filters"><select id="typeFilter" aria-label="Filter record type"><option value="all">All types</option>${['quick',...Object.keys(APPLICATIONS)].map(type=>`<option value="${type}" ${historyType===type?'selected':''}>${type==='quick'?'Quick Scan':APPLICATIONS[type].name}</option>`).join('')}</select><select id="dateFilter" aria-label="Filter date"><option value="all">All dates</option>${dates.map(date=>`<option ${historyDate===date?'selected':''} value="${date}">${esc(date)}</option>`).join('')}</select></div>${!filtered.length?`<div class="card empty">${icon('history')}<h2>${records.length?'No matching records':'No records yet'}</h2><p class="subtitle">Your completed and interrupted detections will appear here.</p><a class="button primary" href="#/quick">Start a Quick Scan</a></div>`:filtered.map((record,index)=>{
+    const prior=filtered[index-1];const date=new Date(record.startedAt).toDateString();let group=date;
+    if(date===new Date().toDateString())group='Today';else if(date===new Date(now()-86400000).toDateString())group='Yesterday';
+    const latest=record.points?.at(-1);const value=record.type==='quick'?(latest?latest.concentration.toFixed(2)+'%':'No prediction'):STATES[record.type]?.[record.result?.status]?.label||'Unavailable';
+    return `${!prior||new Date(prior.startedAt).toDateString()!==date?`<h2 class="section-title">${esc(group)}</h2>`:''}<a class="card record-card" href="#/history/${encodeURIComponent(record.id)}"><div class="record-top">${icon(record.type==='quick'?'play':APPLICATIONS[record.type]?.icon)}<strong>${recordName(record)}</strong><span class="pill ${record.status}">${record.status==='running'?'Detecting':record.status[0].toUpperCase()+record.status.slice(1)}</span>${record.source==='demo'?'<span class="demo-badge">Demo</span>':''}</div><span class="small muted">${dateText(record.startedAt)}</span><div class="record-middle"><div><div class="record-number" style="${record.type==='quick'?'':'font-size:19px'}">${esc(value)}</div><span class="small muted">${record.status==='completed'?'Final prediction':'Last prediction'}</span></div>${record.type==='quick'?`<canvas class="sparkline" data-record-chart="${record.id}" aria-label="Concentration trend"></canvas>`:''}${icon('chevron')}</div><div class="record-bottom">${Math.round((record.durationMs||0)/1000)} s${record.type==='quick'?` · ${record.points.length} results`:''}</div></a>`;
+  }).join('')}<p class="small muted" style="text-align:center">${storageReady?'Saved in this browser':'Local storage unavailable'}</p>`;
 }
-
-function showCompatibility() {
-  const messages = [];
-  if (!window.isSecureContext) messages.push("This page is not running in a secure context. Open it through GitHub Pages over HTTPS.");
-  if (!("bluetooth" in navigator)) messages.push("This browser does not support Web Bluetooth. Use Chrome on Android or Chrome/Edge on Windows.");
-  if (messages.length) {
-    state.compatible = false;
-    ui.compatibilityWarning.hidden = false;
-    ui.compatibilityWarning.textContent = messages.join(" ");
-    ui.connectButton.disabled = true;
+function historyDetail(id){
+  const record=records.find(r=>r.id===id)||(quick?.record.id===id?quick.record:null);if(!record)return notFound('Record not found');
+  activeRecord=record;
+  const points=record.points||[],latest=points.at(-1);
+  return `<h1 class="page-title">Record details</h1><section class="card"><div class="record-top"><strong>${recordName(record)}</strong><span class="pill ${record.status}">${esc(record.status)}</span>${record.source==='demo'?'<span class="demo-badge">Demo Mode</span>':''}</div><span class="small muted">${dateText(record.startedAt)}</span>${record.type==='quick'?`<div class="result-value">${latest?latest.concentration.toFixed(2)+'%':'—'}</div><span class="small muted">${record.status==='completed'?'Final prediction':'Last prediction'} · ${Math.round(record.durationMs/1000)} s · ${points.length} results</span>`:''}</section>${record.type==='quick'?`<section class="card chart-card"><h2>Concentration over time</h2><canvas id="historyChart" class="chart" role="img" aria-label="Recorded concentration curve"></canvas></section><section class="card"><h2 class="section-title" style="margin-top:0">Prediction summary</h2><div class="summary-stats">${[['Minimum',points.length?Math.min(...points.map(p=>p.concentration)):null],['Maximum',points.length?Math.max(...points.map(p=>p.concentration)):null],['Final',latest?.concentration]].map(([name,n])=>`<div><span>${name}</span><strong>${n==null?'—':n.toFixed(2)+'%'}</strong></div>`).join('')}</div></section>`:resultCard(record.result)}${button('export-record','Download CSV','primary','download')}${button('delete-record','Delete record','danger','trash',busy()&&quick?.record.id===record.id)}<p class="small muted" style="text-align:center">Deletion requires confirmation.</p>`;
+}
+const modelItems=[['concentration','Concentration','model'],...Object.entries(APPLICATIONS).map(([key,a])=>[key,a.name,a.icon])];
+function modelPage(){return `<h1 class="page-title">Model</h1><p class="subtitle">Select a model</p><div class="model-list">${modelItems.map(([type,name,glyph])=>`<a class="card model-entry" href="#/models/${type}"><span class="icon-tile ${type}">${icon(glyph)}</span><strong>${name}</strong>${icon('chevron')}</a>`).join('')}</div>`;}
+function modelDetail(type){
+  const item=modelItems.find(row=>row[0]===type);if(!item)return notFound();
+  const concentration=type==='concentration';const provider=applications.providers.get(type);
+  return `<h1 class="page-title">${item[1]}</h1><p class="subtitle">Model details</p><section class="card"><div class="detail-heading"><div class="icon-tile ${type}">${icon(item[2])}</div><h2>${concentration?'Concentration Model':item[1]+' Model'}</h2></div><div class="rows detail-grid"><div class="row"><span class="row-label">Status</span><span class="row-value">${concentration?(models.ready?'Ready':models.state==='loading'?'Loading':'Not loaded'):provider?'Configured':'Not configured'}</span></div><div class="row"><span class="row-label">${concentration?'Version':'Model ID'}</span><span class="row-value">${concentration?'V8 · Five-fold ensemble':esc(provider?.metadata.modelId||'—')}</span></div><div class="row"><span class="row-label">Input</span><span class="row-value">224 samples · CH2 + CH3</span></div>${concentration?'<div class="row"><span class="row-label">Output range</span><span class="row-value">0–100%</span></div><div class="row"><span class="row-label">Solution system</span><span class="row-value">To be confirmed</span></div>':''}</div></section>${concentration?`<section class="card"><span class="label">MODEL LOADING</span><div class="fold-grid">${models.folds.map((state,i)=>`<div class="fold">Fold ${i+1}<strong>${state}</strong></div>`).join('')}</div><p class="notice">Average of 5 models. Use with the matching trained solution system.</p>${button('reload-models','Reload Models','primary','reload',busy()||models.state==='loading')}${models.error?`<p class="notice error">${esc(models.error)}</p>`:''}</section>`:`<section class="card"><p class="small muted">${type==='safety'?'Requires the validated 31-liquid classifier and verified hazard references.':type==='food'?'Apple reference groups: Fresh, Intermediate, Aged.':type==='pharma'?'Reference formulation comparison. This does not determine expiry or pharmacopoeial compliance.':'Target: ethylene glycol. Identification and concentration require separate validated support.'}</p>${settings.demo?`<label class="label" for="demoState">Demo result</label><select id="demoState" data-type="${type}">${Object.entries(STATES[type]).map(([key,value])=>`<option value="${key}" ${(demoStates[type]||demoResult(type).status)===key?'selected':''}>${value.label}</option>`).join('')}</select>`:''}<a class="button ${settings.demo?'primary':'secondary'}" style="margin-top:15px" href="#/application/${type}">${settings.demo?'Preview Demo Result':'Open Result Page'}</a></section>`}`;
+}
+function settingsPage(){
+  const row=(glyph,label,value,action='')=>`<${action?'button':'div'} class="row" ${action?`data-action="${action}"`:''}>${icon(glyph)}<span class="row-label">${label}</span>${value?`<span class="row-value">${value}</span>`:''}${action?icon('chevron'):''}</${action?'button':'div'}>`;
+  const toggle=(key,label,glyph)=>`<label class="row">${icon(glyph)}<span class="row-label">${label}</span><input class="switch" type="checkbox" data-setting="${key}" aria-label="${label}" ${settings[key]?'checked':''} ${busy()&&key!=='keepAwake'?'disabled':''}></label>`;
+  return `<h1 class="page-title">Settings</h1><h2 class="group-label">DEVICE</h2><section class="card rows">${row('link','Bluetooth device',device.status==='connecting'?'Connecting…':device.connected?'Connected':'Disconnected','connect')}${row('info','Device information',esc(device.name||'—'),'device-info')}${device.connected?row('bluetooth','Disconnect device','','disconnect'):''}</section><h2 class="group-label">DETECTION</h2><section class="card rows">${toggle('keepAwake','Keep screen awake','eye')}${row('info','Auto-stop limit','600 s')}${toggle('demo','Demo Mode','play')}</section><h2 class="group-label">DATA & STORAGE</h2><section class="card rows">${toggle('autoSave','Auto-save records','history')}${row('download','Export all records','','export-all')}<button class="row destructive" data-action="clear-records" ${busy()?'disabled':''}>${icon('trash')}<span class="row-label">Clear local records</span>${icon('chevron')}</button><p class="small muted">${storageReady?'Records are stored in this browser.':'Local record storage is unavailable.'}</p></section><h2 class="group-label">ABOUT</h2><section class="card rows">${row('info','App version','V5')}${row('info','About MoPod','','about')}</section>`;
+}
+function notFound(message='Page not found'){return `<div class="card empty"><h1>${message}</h1><a class="button primary" href="#/home">Back to Home</a></div>`;}
+function render(preserveScroll=false){
+  route=getRoute();const scroll=content.scrollTop;const [page,id]=route;
+  renderNavigation();activeRecord=null;
+  content.innerHTML=page==='home'?homePage():page==='quick'?quickPage():page==='application'?applicationPage(id):page==='history'?(id?historyDetail(decodeURIComponent(id)):historyPage()):page==='models'?(id?modelDetail(id):modelPage()):page==='settings'?settingsPage():notFound();
+  content.scrollTop=preserveScroll?scroll:0;
+  if(page==='quick'){updateQuick();if(models.state==='idle')void models.load();}
+  if(page==='history'){
+    if(id&&activeRecord?.type==='quick')plot(document.querySelector('#historyChart'),activeRecord.points);
+    else document.querySelectorAll('[data-record-chart]').forEach(canvas=>plot(canvas,records.find(r=>r.id===canvas.dataset.recordChart)?.points||[],{mini:true}));
   }
 }
-
-function formatSeconds(value) {
-  return Number.isInteger(value) ? String(value) : value.toFixed(1);
+async function refreshRecords(){if(storageReady){records=await store.list();if(route[0]==='history')render(true);}}
+async function persist(record,round){
+  if(!record.autoSave||!storageReady)return;
+  try{if(round)await store.saveRound(record.id,round.roundNumber,round.samples);await store.save(structuredClone(record));}
+  catch(error){record.autoSave=false;toast('Record storage failed. Download this run before leaving the page.');log(error.message);}
 }
-
-function getDurationPlan(clampValue = false) {
-  let seconds = Number(ui.durationInput.value);
-  if (clampValue) {
-    if (!Number.isFinite(seconds)) seconds = 60;
-    seconds = Math.max(ACQUISITION.minimumTotalSeconds, Math.min(ACQUISITION.maximumTotalSeconds, seconds));
-    ui.durationInput.value = String(seconds);
-  }
-  if (!Number.isFinite(seconds)
-      || seconds < ACQUISITION.minimumTotalSeconds
-      || seconds > ACQUISITION.maximumTotalSeconds) {
-    return null;
-  }
-  const rounds = Math.floor(seconds / ACQUISITION.windowSeconds);
-  return { seconds, rounds, finalTime: rounds * ACQUISITION.windowSeconds };
+async function requestWake(){
+  if(!settings.keepAwake||!busy()||document.visibilityState!=='visible'||wakeLock)return;
+  try{wakeLock=await navigator.wakeLock?.request('screen');wakeLock?.addEventListener('release',()=>wakeLock=null);}catch(error){log(`Screen wake lock: ${error.message}`);}
 }
-
-function updateDurationHint() {
-  const plan = getDurationPlan(false);
-  if (!plan) {
-    ui.durationHint.textContent = "Enter a value from 2 to 600 seconds";
-    return;
-  }
-  ui.durationHint.textContent = `${plan.rounds} rounds; final result at ${formatSeconds(plan.finalTime)} seconds`;
-  if (!state.processing) {
-    state.plannedRounds = plan.rounds;
-    drawChart();
-  }
+async function releaseWake(){try{await wakeLock?.release();}catch{}wakeLock=null;}
+function createRecord(type,source='live_model'){
+  return {id:crypto.randomUUID(),type,source,startedAt:now(),durationMs:0,status:'running',points:[],autoSave:settings.autoSave,modelId:type==='quick'?models.metadata?.modelName:applications.providers.get(type)?.metadata.modelId||null};
 }
-
-async function loadModels() {
-  try {
-    if (!window.ort) throw new Error("ONNX Runtime Web did not load. Check your internet connection.");
-    if (!window.NIRPreprocessing) throw new Error("The V8 preprocessing module did not load.");
-    ort.env.wasm.numThreads = 1;
-    ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/";
-    const response = await fetch("./model/metadata.json", { cache: "no-store" });
-    if (!response.ok) throw new Error(`Failed to load model metadata: HTTP ${response.status}`);
-    state.metadata = await response.json();
-    if (state.metadata.task !== "regression" || state.metadata.seqLen !== ACQUISITION.samplesPerRound) {
-      throw new Error("The model metadata does not match the 224-sample concentration workflow.");
-    }
-    if (!Array.isArray(state.metadata.folds) || state.metadata.folds.length !== 5) {
-      throw new Error("The model metadata must contain five cross-validation models.");
-    }
-    state.modelSessions = [];
-    for (let index = 0; index < state.metadata.folds.length; index += 1) {
-      ui.resultDetail.textContent = `Loading model ${index + 1}/5…`;
-      const session = await ort.InferenceSession.create(state.metadata.folds[index].modelPath, {
-        executionProviders: ["wasm"],
-        graphOptimizationLevel: "all",
+async function startQuick(){
+  if(busy())return;
+  if(!device.connected){toast('Connect your MoPod first.');return;}
+  if(!models.ready){toast('The concentration model is not ready.');return;}
+  const controller=new AbortController(),record=createRecord('quick');
+  const job={record,controller,running:true,processing:true,error:'',rawRounds:[],chain:Promise.resolve(),inferenceErrors:0,reason:'completed'};quick=job;
+  log('Quick Scan started.');render(true);void requestWake();await persist(record);
+  const timeout=setTimeout(()=>{job.reason='completed';controller.abort();},600000);
+  try{
+    await device.configure(controller.signal);
+    for(let roundNumber=1;roundNumber<=400&&!controller.signal.aborted;roundNumber++){
+      const samples=await device.collect(controller.signal);
+      const round={roundNumber,samples};job.rawRounds.push(round);
+      // Schedule inference separately: the next collect starts without awaiting it.
+      job.chain=job.chain.then(async()=>{
+        try{
+          const concentration=await models.predict(samples);
+          record.points.push({roundNumber,timeSeconds:roundNumber*1.5,concentration});
+          record.durationMs=now()-record.startedAt;updateQuick();
+        }catch(error){job.inferenceErrors++;job.error=`Prediction unavailable: ${error.message}`;log(job.error);updateQuick();}
+        await persist(record,round);
       });
-      state.modelSessions.push(session);
     }
-    ui.resultDetail.textContent = "All five concentration models are ready";
-    log("V8 five-fold concentration ensemble loaded");
-  } catch (error) {
-    state.modelSessions = [];
-    ui.resultDetail.textContent = "Model loading failed. Check your connection and refresh the page.";
-    log(`Model loading failed: ${error.message}`);
-  }
-  updateControls();
-}
-
-async function connectDevice() {
-  try {
-    log("Opening the Bluetooth device picker…");
-    const device = await navigator.bluetooth.requestDevice({ filters: [{ services: [BLE.service] }] });
-    state.device = device;
-    device.addEventListener("gattserverdisconnected", handleDisconnected);
-    state.server = await device.gatt.connect();
-    const service = await state.server.getPrimaryService(BLE.service);
-    state.commandCharacteristic = await service.getCharacteristic(BLE.command);
-    state.dataCharacteristic = await service.getCharacteristic(BLE.data);
-    await state.dataCharacteristic.startNotifications();
-    state.dataCharacteristic.addEventListener("characteristicvaluechanged", handleNotification);
-
-    try {
-      state.statusCharacteristic = await service.getCharacteristic(BLE.status);
-      await state.statusCharacteristic.startNotifications();
-      state.statusCharacteristic.addEventListener("characteristicvaluechanged", handleNotification);
-    } catch (error) {
-      log(`Status characteristic unavailable: ${error.message}`);
-    }
-
-    setConnected(true, device.name);
-    log(`BLE connected: ${device.name || "Unnamed device"}`);
-    await writeCommand(PROTOCOL.syncCommand, [], false);
-  } catch (error) {
-    log(`Connection failed: ${error.message}`);
-    setConnected(false);
+  }catch(error){
+    if(error.name!=='AbortError'){job.reason='interrupted';job.error=error.message;log(error.message);}
+  }finally{
+    clearTimeout(timeout);job.running=false;
+    try{await device.shutdown();}catch(error){job.reason='interrupted';job.error=`Device stop failed: ${error.message}`;}
+    updateQuick();await job.chain;job.processing=false;
+    record.durationMs=now()-record.startedAt;record.status=job.reason;
+    if(job.inferenceErrors&&record.status==='completed')record.status='interrupted';
+    await persist(record);await refreshRecords();await releaseWake();
+    log(`Quick Scan ${record.status}.`);if(route[0]==='quick')render(true);else{render(true);toast(`Quick Scan ${record.status}.`);}
   }
 }
-
-function rejectCurrentRound(error) {
-  const context = state.currentRound;
-  if (!context?.accepting) return;
-  context.accepting = false;
-  clearTimeout(context.timeoutId);
-  context.reject(error);
-}
-
-function handleDisconnected() {
-  state.runActive = false;
-  state.abortRequested = true;
-  rejectCurrentRound(new Error("The ESP32 Bluetooth connection was lost."));
-  state.server = null;
-  state.commandCharacteristic = null;
-  state.dataCharacteristic = null;
-  state.statusCharacteristic = null;
-  state.ledPending = false;
-  setConnected(false);
-  log("ESP32 disconnected");
-}
-
-async function disconnectDevice() {
-  if (state.runActive) await stopCollection();
-  if (state.device?.gatt?.connected) state.device.gatt.disconnect();
-  else handleDisconnected();
-}
-
-async function writeCommand(commandId, params, writeLog = true) {
-  if (!state.commandCharacteristic) throw new Error("The command characteristic is unavailable.");
-  const frame = buildCommand(commandId, params);
-  await state.commandCharacteristic.writeValueWithResponse(frame);
-  if (writeLog) {
-    log(`Command sent: ${Array.from(frame, (value) => value.toString(16).padStart(2, "0")).join(" ")}`);
-  }
-}
-
-async function setLed(enabled) {
-  if (!isConnected()) throw new Error("The device is not connected.");
-  if (state.ledPending) throw new Error("An LED command is already in progress.");
-  state.ledPending = true;
-  try {
-    await writeCommand(PROTOCOL.ledCommand, [enabled ? 1 : 0], false);
-    state.ledOn = enabled;
-    log(`LED ${enabled ? "on" : "off"}`);
-  } finally {
-    state.ledPending = false;
-  }
-}
-
-function littleEndianBytes(value, byteCount) {
-  const output = [];
-  let remaining = value;
-  for (let index = 0; index < byteCount; index += 1) {
-    output.push(remaining & 0xff);
-    remaining = Math.floor(remaining / 256);
-  }
-  return output;
-}
-
-async function configureHardware(rounds) {
-  await setLed(true);
-  await new Promise((resolve) => setTimeout(resolve, 100));
-  await writeCommand(PROTOCOL.servoTypeCommand, [PROTOCOL.servo360Mode], false);
-  const params = [
-    ...littleEndianBytes(ACQUISITION.firmwareDurationMs, 4),
-    ...littleEndianBytes(rounds, 2),
-    ACQUISITION.servoSpeedPercent,
-  ];
-  await writeCommand(PROTOCOL.servoConfigCommand, params, false);
-  log(`Acquisition configured: 1500 ms per round, ${rounds} rounds, servo speed 20%`);
-}
-
-function armRound(roundNumber) {
-  let resolve;
-  let reject;
-  const completed = new Promise((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  const context = {
-    roundNumber,
-    deviceRoundIndex: null,
-    samplesByIndex: new Map(),
-    firstEspTimeUs: null,
-    accepting: true,
-    resolve,
-    reject,
-    completed,
-    timeoutId: null,
-  };
-  context.timeoutId = setTimeout(() => {
-    if (!context.accepting) return;
-    context.accepting = false;
-    context.reject(new Error(
-      `Round ${roundNumber} timed out: received only ${context.samplesByIndex.size}/${ACQUISITION.samplesPerRound} valid samples`,
-    ));
-  }, ACQUISITION.roundTimeoutMs);
-  state.currentRound = context;
-  return context;
-}
-
-function acceptBatch(roundIndex, samples) {
-  const context = state.currentRound;
-  if (!state.runActive || !context?.accepting) return;
-
-  let startAt = 0;
-  if (context.deviceRoundIndex === null) {
-    startAt = samples.findIndex((sample) => sample.sampleIndex === 0);
-    if (startAt < 0) return;
-    context.deviceRoundIndex = roundIndex;
-  }
-  if (roundIndex !== context.deviceRoundIndex) return;
-
-  for (let index = startAt; index < samples.length; index += 1) {
-    const sample = samples[index];
-    if (sample.sampleIndex < 0 || sample.sampleIndex >= ACQUISITION.samplesPerRound) continue;
-    if (context.samplesByIndex.has(sample.sampleIndex)) continue;
-    if (context.firstEspTimeUs === null) context.firstEspTimeUs = sample.espTimeUs;
-    context.samplesByIndex.set(sample.sampleIndex, {
-      ...sample,
-      roundIndex,
-      elapsedInRoundMs: (sample.espTimeUs - context.firstEspTimeUs) / 1000,
+function stopQuick(reason='stopped'){if(quick?.running){quick.reason=reason;quick.running=false;quick.controller.abort();updateQuick();}}
+async function scanApplication(type){
+  if(busy())return;
+  if(settings.demo){applications.results.delete(type);render(true);await saveApplicationResult(demoResult(type,demoStates[type]));return;}
+  if(!applications.providers.has(type)){applications.setResult(type,{});render(true);toast('This application model is not configured. No result was generated.');return;}
+  if(!device.connected){toast('Connect your MoPod first.');return;}
+  const controller=new AbortController();appJob={type,controller};render(true);void requestWake();
+  try{
+    await device.configure(controller.signal);
+    const result=await applications.scan(type,controller.signal,async signal=>{
+      const samples=await device.collect(signal);await device.shutdown();return samples;
     });
-  }
-
-  const pointCount = context.samplesByIndex.size;
-  if (pointCount !== ACQUISITION.samplesPerRound) return;
-
-  const ordered = [];
-  for (let sampleIndex = 0; sampleIndex < ACQUISITION.samplesPerRound; sampleIndex += 1) {
-    const sample = context.samplesByIndex.get(sampleIndex);
-    if (!sample) return;
-    ordered.push(sample);
-  }
-  context.accepting = false;
-  clearTimeout(context.timeoutId);
-  context.resolve(ordered);
+    await saveApplicationResult(result);
+  }catch(error){applications.setResult(type,{});toast(error.message);}
+  finally{try{await device.shutdown();}catch(error){toast(error.message);}appJob=null;await releaseWake();render(true);}
 }
-
-function getUint64AsNumber(view, offset) {
-  const low = view.getUint32(offset, true);
-  const high = view.getUint32(offset + 4, true);
-  return high * 0x100000000 + low;
+async function saveApplicationResult(result){
+  const record=createRecord(result.type,result.source);record.result=result;record.status='completed';
+  await persist(record);await refreshRecords();
 }
-
-function parseAdcBatch(view) {
-  if (view.byteLength < 5) return;
-  const roundIndex = view.getUint8(2);
-  const sampleCount = view.getUint8(3);
-  if (view.byteLength !== 5 + sampleCount * 16) {
-    state.rejectedPackets += 1;
+async function connect(){if(busy()){toast('Stop the current detection before changing the device.');return;}try{await device.connect();}catch(error){toast(error.message);}}
+async function exportRecord(record){
+  if(!record)return;
+  if(record.type!=='quick'){
+    const result=record.result;download(`mopod_${record.type}_${record.id}.csv`,'\ufeff'+['Application,Source,Sample,Result,Concentration,Unit,Started_at',[
+      record.type,result.source,result.sampleName,STATES[record.type][result.status].label,result.concentration?.value??'',result.concentration?.unit??'',new Date(record.startedAt).toISOString(),
+    ].map(csvCell).join(',')].join('\r\n'));return;
+  }
+  const rounds=quick?.record.id===record.id?quick.rawRounds:storageReady?await store.rounds(record.id):[];
+  const predictions=new Map(record.points.map(p=>[p.roundNumber,p]));
+  const rows=['Round,Time_s,Concentration_percent,Sample_Index,ESP_Time_us,Elapsed_In_Round_ms,CH2_mV,CH3_mV,Device_Round_Index'];
+  for(const round of rounds){const first=round.samples[0]?.espTimeUs;const prediction=predictions.get(round.roundNumber);for(const sample of round.samples)rows.push([
+    round.roundNumber,(round.roundNumber*1.5).toFixed(1),prediction?prediction.concentration.toFixed(6):'',sample.sampleIndex,sample.espTimeUs,((sample.espTimeUs-first)/1000).toFixed(3),sample.ch2,sample.ch3,sample.roundIndex,
+  ].join(','));}
+  if(!rounds.length){toast('Raw samples are not available for this record.');return;}
+  download(`concentration_${new Date(record.startedAt).toISOString().replace(/[:.]/g,'-')}.csv`,'\ufeff'+rows.join('\r\n'));
+}
+async function handleAction(action){
+  if(action==='home'){go('home');return;}
+  if(action==='connect'){await connect();return;}
+  if(action==='device-info'){go('settings/device');return;}
+  if(action==='start-quick'){void startQuick();return;}
+  if(action==='stop-quick'){stopQuick();return;}
+  if(action.startsWith('scan-')){void scanApplication(action.slice(5));return;}
+  if(action==='export-quick'){await exportRecord(quick?.record);return;}
+  if(action==='export-record'){await exportRecord(activeRecord);return;}
+  if(action==='filter'){document.querySelector('#typeFilter')?.focus();return;}
+  if(action==='reload-models'){if(!busy())await models.load();return;}
+  if(action==='delete-record'){
+    if(!activeRecord)return;const id=activeRecord.id;
+    if(busy()&&quick?.record.id===id)return;
+    if(await confirmAction('Delete record?','This removes this detection and its locally stored samples.')){await store.delete(id);if(quick?.record.id===id)quick=null;await refreshRecords();go('history');}
     return;
   }
-  const samples = [];
-  let offset = 4;
-  for (let index = 0; index < sampleCount; index += 1) {
-    samples.push({
-      sampleIndex: view.getUint32(offset, true),
-      espTimeUs: getUint64AsNumber(view, offset + 4),
-      ch2: view.getUint16(offset + 12, true),
-      ch3: view.getUint16(offset + 14, true),
-    });
-    offset += 16;
+  if(action==='clear-records'){
+    if(busy())return;
+    if(await confirmAction('Clear all records?','This permanently removes detection history stored in this browser.')){await store.clear();records=[];quick=null;render(true);toast('Local records cleared.');}return;
   }
-  acceptBatch(roundIndex, samples);
+  if(action==='export-all'){
+    if(!storageReady){toast('Local storage is unavailable.');return;}
+    const all=await store.list();const bundle=[];
+    for(const record of all)bundle.push({record,rounds:record.type==='quick'?await store.rounds(record.id):[]});
+    download('mopod-v5-records.json',JSON.stringify({version:5,exportedAt:new Date().toISOString(),records:bundle},null,2),'application/json');return;
+  }
+  if(action==='disconnect'){
+    if(busy()){toast('Stop the current detection before disconnecting.');return;}
+    await device.disconnect();render(true);return;
+  }
+  if(action==='about'){go('settings/about');}
 }
-
-function handleNotification(event) {
-  const view = event.target.value;
-  const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
-  if (bytes.length < 3 || bytes[0] !== PROTOCOL.receiveHead) return;
-  if (sumChecksum(bytes.subarray(0, -1)) !== bytes[bytes.length - 1]) {
-    state.rejectedPackets += 1;
-    return;
-  }
-  const packetType = bytes[1];
-  if (packetType === PROTOCOL.ledPacketType && bytes.length >= 5) {
-    state.ledOn = bytes[2] !== 0;
-    return;
-  }
-  if (packetType === PROTOCOL.syncPacketType && bytes.length >= 7) {
-    state.ledOn = bytes[2] !== 0;
-    return;
-  }
-  if (!state.runActive) return;
-  if (packetType === PROTOCOL.adcBatchPacketType) {
-    parseAdcBatch(view);
-  } else if (packetType === PROTOCOL.adcPacketType) {
-    state.rejectedPackets += 1;
-  }
+function settingsSubpage(type){
+  if(type==='device')return `<h1 class="page-title">Device information</h1>${deviceStrip()}<section class="card rows detail-grid"><div class="row"><span class="row-label">Device name</span><span class="row-value">${esc(device.name||'—')}</span></div><div class="row"><span class="row-label">Connection</span><span class="row-value">Bluetooth Low Energy</span></div><div class="row"><span class="row-label">Battery / temperature</span><span class="row-value">Not provided by device</span></div><div class="row"><span class="row-label">Filter position</span><span class="row-value">Telemetry unavailable</span></div></section>${button(device.connected?'disconnect':'connect',device.connected?'Disconnect':'Connect to ESP32','secondary','bluetooth',busy())}`;
+  return `<h1 class="page-title">About MoPod</h1><section class="card"><h2>MoPod V5</h2><p class="small muted">A mobile near-infrared sensing interface. Quick Scan uses the bundled V8 five-fold concentration model. Application-specific models must be configured separately.</p><p class="notice">Demo Mode contains illustrative results and is not a measurement.</p><p class="small muted">Records are kept in this browser. Export records before clearing browser data.</p></section>`;
 }
+// Special settings routes share the same shell and bottom navigation.
+const renderBase=render;
+function routeRender(preserve=false){renderBase(preserve);if(route[0]==='settings'&&route[1]){content.innerHTML=settingsSubpage(route[1]);if(!preserve)content.scrollTop=0;}}
 
-function normalizeFeatures(features, normalization) {
-  const output = new Float32Array(features.length);
-  const channels = normalization.mean.length;
-  for (let index = 0; index < features.length; index += 1) {
-    const channel = index % channels;
-    output[index] = (features[index] - normalization.mean[channel]) / normalization.std[channel];
+document.addEventListener('click',event=>{
+  const target=event.target.closest('[data-action]');if(target&&!target.disabled)handleAction(target.dataset.action).catch(error=>toast(error.message));
+});
+document.querySelector('#back').addEventListener('click',()=>{
+  if(route[0]==='history'&&route[1])go('history');else if(route[0]==='models'&&route[1])go('models');else if(route[0]==='settings'&&route[1])go('settings');else go('home');
+});
+document.querySelector('#bluetooth').addEventListener('click',()=>void connect());
+document.addEventListener('change',async event=>{
+  const target=event.target;
+  if(target.dataset.setting){
+    const key=target.dataset.setting;
+    if(busy()&&key!=='keepAwake'){target.checked=settings[key];return;}
+    settings[key]=target.checked;saveSettings();
+    if(key==='keepAwake'){if(settings[key])void requestWake();else void releaseWake();}
+    if(key==='demo'){applications.results.clear();toast(settings.demo?'Demo Mode enabled. Application results are illustrative.':'Live mode enabled. Only verified model results will be shown.');}
+    routeRender(true);
   }
-  return output;
-}
-
-async function inferRound(samples) {
-  const prepared = window.NIRPreprocessing.prepareFeatures(samples, state.metadata.seqLen);
-  const predictions = [];
-  for (let index = 0; index < state.modelSessions.length; index += 1) {
-    const session = state.modelSessions[index];
-    const fold = state.metadata.folds[index];
-    const inputData = normalizeFeatures(prepared.features, fold.normalization);
-    const outputs = await session.run({
-      [session.inputNames[0]]: new ort.Tensor(
-        "float32",
-        inputData,
-        [1, state.metadata.seqLen, state.metadata.inputChannels],
-      ),
-    });
-    const raw = Number(outputs[session.outputNames[0]].data[0]);
-    const clamped = Math.max(0, Math.min(1, raw));
-    predictions.push(
-      state.metadata.targetMin
-      + clamped * (state.metadata.targetMax - state.metadata.targetMin),
-    );
-  }
-  const concentration = predictions.reduce((total, value) => total + value, 0) / predictions.length;
-  return { concentration, alignment: prepared.alignment };
-}
-
-function queueInference(runId, roundNumber, samples) {
-  const task = state.inferenceChain.then(
-    () => inferRound(samples),
-    () => inferRound(samples),
-  );
-  state.inferenceChain = task.catch(() => undefined);
-  state.inferencePromises.push(task);
-  task.then(({ concentration, alignment }) => {
-    if (runId !== state.runId) return;
-    const result = {
-      roundNumber,
-      timeSeconds: roundNumber * ACQUISITION.windowSeconds,
-      concentration,
-      periodSamples: alignment.periodSamples,
-    };
-    state.results.push(result);
-    state.results.sort((left, right) => left.roundNumber - right.roundNumber);
-    ui.resultName.textContent = `${concentration.toFixed(2)}%`;
-    ui.resultDetail.textContent = `Round ${roundNumber} · five-model mean`;
-    ui.downloadButton.disabled = false;
-    drawChart();
-    log(`Round ${roundNumber} complete: ${concentration.toFixed(2)}%`);
-  }).catch((error) => {
-    if (runId !== state.runId) return;
-    ui.resultDetail.textContent = `Round ${roundNumber} calculation failed: ${error.message}`;
-    log(`Round ${roundNumber} inference failed: ${error.stack || error.message}`);
-  });
-  return task;
-}
-
-async function cleanupHardware() {
-  if (state.cleanupPromise) return state.cleanupPromise;
-  state.cleanupPromise = (async () => {
-    if (isConnected()) {
-      try {
-        await writeCommand(PROTOCOL.adcCommand, [PROTOCOL.stopMode], false);
-      } catch (error) {
-        log(`Failed to stop the ADC: ${error.message}`);
-      }
-      try {
-        await setLed(false);
-      } catch (error) {
-        log(`Failed to turn off the LED: ${error.message}`);
-      }
-    }
-  })();
-  return state.cleanupPromise;
-}
-
-async function startCollection() {
-  if (!isConnected() || state.processing || !modelsReady()) return;
-  const plan = getDurationPlan(true);
-  if (!plan || plan.rounds < 1) return;
-
-  const runId = state.runId + 1;
-  state.runId = runId;
-  state.runActive = true;
-  state.processing = true;
-  state.abortRequested = false;
-  state.plannedRounds = plan.rounds;
-  state.currentRound = null;
-  state.cleanupPromise = null;
-  state.inferenceChain = Promise.resolve();
-  state.inferencePromises = [];
-  state.rawRounds = [];
-  state.results = [];
-  state.rejectedPackets = 0;
-  ui.resultName.textContent = "Acquiring…";
-  ui.resultDetail.textContent = `${plan.rounds} planned rounds · 224 valid samples per round`;
-  drawChart();
-  updateControls();
-
-  try {
-    await configureHardware(plan.rounds);
-    let context = armRound(1);
-    await writeCommand(PROTOCOL.adcCommand, [PROTOCOL.continuousMode], false);
-    log(`Monitoring started: ${plan.seconds} seconds, ${plan.rounds} rounds`);
-
-    for (let roundNumber = 1; roundNumber <= plan.rounds; roundNumber += 1) {
-      const samples = await context.completed;
-      if (!state.runActive || runId !== state.runId) throw new Error("Monitoring has stopped.");
-      state.rawRounds.push({ roundNumber, samples });
-
-      await writeCommand(PROTOCOL.adcCommand, [PROTOCOL.stopMode], false);
-      let nextContext = null;
-      let nextStartPromise = null;
-      if (roundNumber < plan.rounds) {
-        nextContext = armRound(roundNumber + 1);
-        nextStartPromise = writeCommand(PROTOCOL.adcCommand, [PROTOCOL.continuousMode], false);
-      } else {
-        state.currentRound = null;
-      }
-
-      queueInference(runId, roundNumber, samples);
-      if (nextStartPromise) await nextStartPromise;
-      context = nextContext;
-
-      if (roundNumber === 1 || roundNumber === plan.rounds || roundNumber % 10 === 0) {
-        log(`Acquisition progress: ${roundNumber}/${plan.rounds} rounds, 224 samples per round`);
-      }
-    }
-
-    state.runActive = false;
-    await cleanupHardware();
-    ui.resultDetail.textContent = `Acquisition complete · waiting for ${state.inferencePromises.length - state.results.length} calculations`;
-    await Promise.allSettled(state.inferencePromises);
-    if (runId !== state.runId) return;
-
-    const latest = state.results[state.results.length - 1];
-    if (latest) ui.resultName.textContent = `${latest.concentration.toFixed(2)}%`;
-    ui.resultDetail.textContent = state.results.length === plan.rounds
-      ? `Monitoring complete · ${plan.rounds} rounds`
-      : `Monitoring complete · ${state.results.length}/${plan.rounds} calculations succeeded`;
-    log(`Run complete: ${state.rawRounds.length} rounds acquired, ${state.results.length} calculated, ${state.rejectedPackets} invalid packets`);
-  } catch (error) {
-    state.runActive = false;
-    rejectCurrentRound(error);
-    await cleanupHardware();
-    await Promise.allSettled(state.inferencePromises);
-    if (state.abortRequested) {
-      ui.resultName.textContent = state.results.length ? `${state.results[state.results.length - 1].concentration.toFixed(2)}%` : "Stopped";
-      ui.resultDetail.textContent = `Monitoring stopped · ${state.results.length}/${plan.rounds} rounds complete`;
-      log("Monitoring stopped by the user");
-    } else {
-      ui.resultName.textContent = "Monitoring failed";
-      ui.resultDetail.textContent = error.message;
-      log(`Monitoring failed: ${error.stack || error.message}`);
-    }
-  } finally {
-    if (runId === state.runId) {
-      state.runActive = false;
-      state.processing = false;
-      state.currentRound = null;
-      updateControls();
-      drawChart();
-    }
-  }
-}
-
-async function stopCollection() {
-  if (!state.runActive) return;
-  state.abortRequested = true;
-  state.runActive = false;
-  rejectCurrentRound(new Error("Monitoring stopped by the user."));
-  ui.stopButton.disabled = true;
-  ui.resultDetail.textContent = "Stopping the ADC, servo, and LED…";
-  await cleanupHardware();
-}
-
-function drawChart() {
-  const canvas = ui.concentrationChart;
-  const rect = canvas.getBoundingClientRect();
-  if (rect.width < 10 || rect.height < 10) return;
-  const ratio = Math.min(window.devicePixelRatio || 1, 2);
-  const pixelWidth = Math.round(rect.width * ratio);
-  const pixelHeight = Math.round(rect.height * ratio);
-  if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
-    canvas.width = pixelWidth;
-    canvas.height = pixelHeight;
-  }
-  const context = canvas.getContext("2d");
-  context.setTransform(ratio, 0, 0, ratio, 0, 0);
-  const width = rect.width;
-  const height = rect.height;
-  context.clearRect(0, 0, width, height);
-
-  const margin = { left: 78, right: 18, top: 16, bottom: 66 };
-  const plotWidth = Math.max(1, width - margin.left - margin.right);
-  const plotHeight = Math.max(1, height - margin.top - margin.bottom);
-  const latestResultTime = state.results.length
-    ? state.results[state.results.length - 1].timeSeconds
-    : ACQUISITION.windowSeconds;
-  const xMaximum = Math.max(ACQUISITION.windowSeconds, latestResultTime);
-  context.font = "12px Inter, Arial, sans-serif";
-  context.textBaseline = "middle";
-
-  for (let tick = 0; tick <= 5; tick += 1) {
-    const yValue = tick * 20;
-    const y = margin.top + plotHeight * (1 - yValue / 100);
-    context.strokeStyle = "#dce3ed";
-    context.lineWidth = 1;
-    context.beginPath();
-    context.moveTo(margin.left, y);
-    context.lineTo(width - margin.right, y);
-    context.stroke();
-    context.fillStyle = "#697386";
-    context.textAlign = "right";
-    context.fillText(`${yValue}%`, margin.left - 8, y);
-  }
-
-  for (let tick = 0; tick <= 5; tick += 1) {
-    const value = xMaximum * tick / 5;
-    const x = margin.left + plotWidth * tick / 5;
-    context.fillStyle = "#697386";
-    context.textAlign = tick === 0 ? "left" : tick === 5 ? "right" : "center";
-    context.fillText(formatSeconds(Number(value.toFixed(1))), x, margin.top + plotHeight + 18);
-  }
-
-  context.strokeStyle = "#344054";
-  context.lineWidth = 1.4;
-  context.beginPath();
-  context.moveTo(margin.left, margin.top);
-  context.lineTo(margin.left, margin.top + plotHeight);
-  context.lineTo(width - margin.right, margin.top + plotHeight);
-  context.stroke();
-
-  context.save();
-  context.fillStyle = "#172033";
-  context.font = "600 13px Inter, Arial, sans-serif";
-  context.textAlign = "center";
-  context.textBaseline = "middle";
-  context.fillText("Cumulative time (s)", margin.left + plotWidth / 2, height - 13);
-  context.translate(17, margin.top + plotHeight / 2);
-  context.rotate(-Math.PI / 2);
-  context.fillText("Predicted concentration (%)", 0, 0);
-  context.restore();
-
-  if (!state.results.length) {
-    context.fillStyle = "#929bad";
-    context.textAlign = "center";
-    context.fillText("Waiting for concentration data", margin.left + plotWidth / 2, margin.top + plotHeight / 2);
-    return;
-  }
-
-  const points = state.results.map((result) => ({
-    x: margin.left + plotWidth * result.timeSeconds / xMaximum,
-    y: margin.top + plotHeight * (1 - result.concentration / 100),
-  }));
-  context.strokeStyle = "#0b6bcb";
-  context.lineWidth = 2.5;
-  context.lineJoin = "round";
-  context.lineCap = "round";
-  context.beginPath();
-  points.forEach((point, index) => {
-    if (index === 0) context.moveTo(point.x, point.y);
-    else context.lineTo(point.x, point.y);
-  });
-  context.stroke();
-  context.fillStyle = "#087f5b";
-  for (const point of points) {
-    context.beginPath();
-    context.arc(point.x, point.y, 3.2, 0, Math.PI * 2);
-    context.fill();
-  }
-}
-
-function downloadCsv() {
-  if (!state.rawRounds.length) return;
-  const concentrationByRound = new Map(state.results.map((result) => [result.roundNumber, result.concentration]));
-  const rows = ["Round,Time_s,Concentration_percent,Sample_Index,ESP_Time_us,Elapsed_In_Round_ms,CH2_mV,CH3_mV,Device_Round_Index"];
-  for (const round of state.rawRounds) {
-    const concentration = concentrationByRound.get(round.roundNumber);
-    for (const sample of round.samples) {
-      rows.push([
-        round.roundNumber,
-        (round.roundNumber * ACQUISITION.windowSeconds).toFixed(1),
-        concentration === undefined ? "" : concentration.toFixed(6),
-        sample.sampleIndex,
-        sample.espTimeUs,
-        sample.elapsedInRoundMs.toFixed(3),
-        sample.ch2,
-        sample.ch3,
-        sample.roundIndex,
-      ].join(","));
-    }
-  }
-  const blob = new Blob(["\ufeff" + rows.join("\r\n")], { type: "text/csv;charset=utf-8" });
-  const link = document.createElement("a");
-  link.href = URL.createObjectURL(blob);
-  link.download = `concentration_${new Date().toISOString().replace(/[:.]/g, "-")}.csv`;
-  link.click();
-  URL.revokeObjectURL(link.href);
-}
-
-ui.connectButton.addEventListener("click", () => { void connectDevice(); });
-ui.startButton.addEventListener("click", () => { void startCollection(); });
-ui.stopButton.addEventListener("click", () => { void stopCollection(); });
-ui.disconnectButton.addEventListener("click", () => { void disconnectDevice(); });
-ui.downloadButton.addEventListener("click", downloadCsv);
-ui.durationInput.addEventListener("input", updateDurationHint);
-window.addEventListener("resize", () => window.requestAnimationFrame(drawChart));
-
-setConnected(false);
-updateDurationHint();
-showCompatibility();
-drawChart();
-void loadModels();
+  if(target.id==='typeFilter'){historyType=target.value;render();}
+  if(target.id==='dateFilter'){historyDate=target.value;render();}
+  if(target.id==='demoState')demoStates[target.dataset.type]=target.value;
+});
+window.addEventListener('hashchange',()=>routeRender());
+device.addEventListener('change',()=>{if(route[0]==='quick'){renderNavigation();const strip=document.querySelector('.connection-strip');if(strip)strip.outerHTML=deviceStrip();updateQuick();}else routeRender(true);});
+device.addEventListener('disconnected',()=>{if(quick?.running){quick.reason='interrupted';quick.error='Bluetooth connection interrupted.';quick.controller.abort();}appJob?.controller.abort();});
+models.addEventListener('change',()=>{if(route[0]==='quick')updateQuick();else if(route[0]==='models')routeRender(true);});
+applications.addEventListener('change',()=>{if(route[0]==='application'||route[0]==='models')routeRender(true);});
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')void requestWake();});
+window.addEventListener('resize',()=>{updateQuick();if(route[0]==='history')routeRender(true);});
+window.addEventListener('pagehide',()=>{if(quick?.running)stopQuick('interrupted');appJob?.controller.abort();void device.shutdown().catch(()=>{});});
+// Stable integration interface: real application adapters never fall back to demo data.
+window.MoPod={
+  version:'V5',registerApplication:(type,provider,metadata)=>applications.register(type,provider,metadata),
+  updateApplicationResult:(type,payload)=>applications.setResult(type,payload),
+  openApplication:type=>go('application/'+type),
+};
+if(!location.hash)history.replaceState(null,'','#/home');routeRender();
+store.open().then(async()=>{storageReady=true;await refreshRecords();if(route[0]==='settings'||route[0]==='history')routeRender(true);}).catch(error=>{log(error.message);toast('Local storage unavailable. Records will not be saved.');});
